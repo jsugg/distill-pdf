@@ -1,0 +1,1483 @@
+#!/usr/bin/env python3
+"""
+DistillPDF.
+
+This script provides comprehensive functionalities to optimize and transform
+PDF files. It includes capabilities for resizing and compressing images within
+PDFs, converting images to grayscale, flattening form fields and annotations,
+and aggressively subsetting embedded fonts to reduce file size.
+Vector graphics within PDFs are optimized for minimal visual alteration using
+Bayesian optimization techniques. Additional functionalities include removing
+metadata for privacy, cleaning unused resources, and optimizing the entire
+content stream of PDF pages.
+
+Features:
+    - Image resizing and compression to predefined dimensions and quality.
+    - Conversion of colored images to grayscale to reduce complexity.
+    - Flattening of PDF annotations and form fields to static images.
+    - Font subsetting to include only the characters used in the document.
+    - Metadata removal for enhanced privacy and security.
+    - Cleanup of unreferenced PDF resources to shrink file size.
+    - Content stream optimization to strip unnecessary data.
+    - Vector graphic simplification based on adjustable precision levels.
+    - Multi-threaded processing for performance optimization.
+    - Detailed logging of processes and errors for troubleshooting and analysis.
+
+The script utilizes a combination of libraries including PyMuPDF (fitz), pikepdf,
+PIL, OpenCV, scikit-learn, scipy, and numpy to perform its operations, integrating
+advanced image processing, machine learning for optimization decisions, and direct
+PDF manipulation capabilities.
+
+Setup:
+    Ensure Python complies with: 3.6 > version < 3.9
+    
+    $ pip install -r requirements.txt
+    $ chmod +x distillpdf
+    
+    (Recommended) Move the distillpdf script to a directory in your PATH, and modify
+    this file's shebang to point to your compatible Python binary location.
+
+Usage:
+    To use the script, provide an input PDF file and an output destination, along with
+    optional flags for grayscale conversion, flattening, and specifying the number of
+    processing threads. The script is designed to be run as a script and can be invoked
+    from the command line.
+
+Example:
+    $ ./distillpdf input.pdf output.pdf --threads=4 --grayscale --flatten
+
+Design:
+    This script is designed for high-performance environments where precision and file
+    size reduction are critical, suitable for both commercial and academic applications.
+
+Author:
+    Juan Sugg Gilbert
+    juanpedrosugg [at] gmail [dot] com
+
+License:
+    This script is licensed under the GNU Affero General Public License v3.0
+"""
+
+from multiprocessing.pool import ApplyResult
+import os
+import sys
+import traceback
+import io
+import subprocess
+import argparse
+import tempfile
+import logging
+import shutil
+from typing import Any, List, Tuple, Set, Optional, Union, Callable
+import math
+import random
+import concurrent.futures
+from functools import lru_cache
+import multiprocessing
+import difflib
+
+import numpy as np
+import cv2
+from scipy.stats import norm
+from scipy.optimize import minimize, OptimizeResult
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import Matern, Sum, WhiteKernel
+from skimage.metrics import structural_similarity as ssim
+import pytesseract
+from PIL import Image
+from fontTools import subset
+from fontTools.ttLib import TTFont
+import pikepdf
+import fitz  # PyMuPDF
+from svglib.svglib import svg2rlg
+from reportlab.graphics import renderPDF
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+# Custom exception classes
+class PDFProcessingError(Exception):
+    """Base class for exceptions in this module."""
+
+
+class FileAccessError(PDFProcessingError):
+    """Exception raised for errors accessing input or output files."""
+
+
+class ImageProcessingError(PDFProcessingError):
+    """Exception raised for errors during image processing."""
+
+
+class VectorOptimizationError(PDFProcessingError):
+    """Exception raised for errors during vector optimization."""
+
+
+class FontSubsettingError(PDFProcessingError):
+    """Exception raised for errors during font subsetting."""
+
+
+class ContentOptimizationError(PDFProcessingError):
+    """Exception raised for errors during content stream optimization."""
+
+
+def parse_arguments() -> argparse.Namespace:
+    """
+    Parse command-line arguments for the Advanced PDF Distiller.
+
+    Returns:
+        argparse.Namespace: The parsed command-line arguments.
+    """
+
+    parser = argparse.ArgumentParser(description="Advanced PDF Distiller")
+    parser.add_argument("input_file", type=str, help="Input PDF file")
+    parser.add_argument(
+        "output_file", type=str, help="Output optimized PDF file"
+    )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=os.cpu_count(),
+        help="Number of threads to use",
+    )
+    parser.add_argument(
+        "--grayscale", action="store_true", help="Convert images to grayscale"
+    )
+    parser.add_argument(
+        "--flatten",
+        action="store_true",
+        help="Flatten form fields and annotations",
+    )
+    return parser.parse_args()
+
+
+def get_text_from_image(image: np.ndarray) -> str:
+    """
+    Extract text from an image using OCR.
+
+    Args:
+        image: The image from which text will be extracted.
+
+    Returns:
+        str: The extracted text from the image.
+    """
+
+    return pytesseract.image_to_string(
+        Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))  # type: ignore  # pylint: disable=no-member  # pylance: disable=reportAttributeAccessIssue
+    )
+
+
+def is_ocr_readable(
+    original_text: str,
+    compressed_image: np.ndarray,
+    similarity_threshold: float = 0.8,
+) -> bool:
+    """
+    Check if the OCR text extracted from a compressed image
+    is readable compared to the original text.
+
+    Args:
+        original_text: The original text for comparison.
+        compressed_image: The compressed image to extract text from.
+        similarity_threshold: The minimum similarity ratio required
+                              for text to be considered readable.
+
+    Returns:
+        bool: True if the OCR text is readable based on the
+              similarity threshold, False otherwise.
+    """
+
+    compressed_text: str = get_text_from_image(compressed_image)
+    similarity: float = difflib.SequenceMatcher(
+        None, original_text, compressed_text
+    ).ratio()
+    return similarity >= similarity_threshold
+
+
+def optimize_raster_image(
+    image_bytes: bytes, max_width: int = 1000, quality: int = 85
+) -> bytes:
+    """
+    Optimize a raster image by resizing and compressing it.
+
+    Args:
+        image_bytes (bytes): The original image bytes.
+        max_width (int): Maximum width of the optimized image.
+        quality (int): JPEG quality for the optimized image.
+
+    Returns:
+        bytes: The optimized image bytes.
+    """
+    try:
+        nparr: np.ndarray = np.frombuffer(image_bytes, np.uint8)
+        img: np.ndarray = cv2.imdecode(  # type: ignore  # pylint: disable=no-member # pylance: disable=reportAttributeAccessIssue
+            nparr, cv2.IMREAD_UNCHANGED  # type: ignore  # pylint: disable=no-member # pylance: disable=reportAttributeAccessIssue
+        )
+        if img is None:
+            raise ImageProcessingError("Failed to decode image")
+        h: Union[int, Any]
+        w: Union[int, Any]
+        h, w = img.shape[:2]
+        if w > max_width:
+            ratio: float = max_width / w
+            new_h: int = int(h * ratio)
+            img = cv2.resize(  # type: ignore  # pylint: disable=no-member # pylance: disable=reportAttributeAccessIssue
+                img,
+                (max_width, new_h),
+                interpolation=cv2.INTER_AREA,  # type: ignore  # pylint: disable=no-member # pylance: disable=reportAttributeAccessIssue
+            )  # pylint: disable=no-member
+        optimized_img: Any
+        _: Any
+        _, optimized_img = cv2.imencode(  # type: ignore  # pylint: disable=no-member # pylance: disable=reportAttributeAccessIssue
+            ".jpg",
+            img,
+            [int(cv2.IMWRITE_JPEG_QUALITY), quality],  # type: ignore  # pylint: disable=no-member # pylance: disable=reportAttributeAccessIssue
+        )
+        if optimized_img is None:
+            raise ImageProcessingError("Failed to encode optimized image")
+
+        return optimized_img.tobytes()
+    except Exception as e:  # pylint: disable=broad-except
+        raise ImageProcessingError(
+            f"Error optimizing raster image: {e}"
+        ) from e
+
+
+def get_image_in_bytes_representation(image: fitz.Pixmap) -> bytes:
+    """
+    Get the byte representation of an image in PNG format.
+
+    Args:
+        image: The image to convert to bytes.
+
+    Returns:
+        bytes: The byte representation of the image in PNG format.
+    """
+
+    return image.tobytes("png")
+
+
+def is_rect_finite(rect: fitz.Rect) -> bool:
+    """
+    Check if all coordinates of a rectangle are finite.
+
+    Args:
+        rect: The rectangle to check.
+
+    Returns:
+        bool: True if all coordinates of the rectangle are finite, False otherwise.
+    """
+
+    return all(
+        math.isfinite(coord) for coord in [rect.x0, rect.y0, rect.x1, rect.y1]
+    )
+
+
+def get_dpi(image_path: str, default_dpi: int = 300) -> int:
+    """
+    Attempt to determine the DPI from the image metadata or return a default.
+
+    Args:
+        image_path (str): Path to the image file.
+        default_dpi (int): Default DPI to use if specific DPI isn't found.
+
+    Returns:
+        int: The DPI of the image.
+    """
+    try:
+        with Image.open(image_path) as img:
+            dpi: Any = img.info.get("dpi", (default_dpi, default_dpi))
+            return (
+                (dpi[0] + dpi[1]) // 2 if isinstance(dpi, int) else default_dpi  # type: ignore
+            )
+    except Exception as e:  # pylint: disable=broad-except
+        logging.error("Error determining DPI: %s", e)
+        return default_dpi
+
+
+def get_image_rect(
+    page: fitz.Page, img_xref: int, image_path: str
+) -> Optional[fitz.Rect]:
+    """
+    Get the rectangle of an image on a PDF page.
+
+    Args:
+        page: The PDF page containing the image.
+        img_xref: The cross-reference ID of the image.
+        image_path: The path to the image file.
+
+    Returns:
+        Optional[fitz.Rect]: The rectangle of the image on the page,
+        or None if not found or an error occurs.
+    """
+
+    try:
+        dpi: int = get_dpi(image_path)
+        img_list: List[Tuple] = page.get_images(full=True)
+        for img in img_list:
+            if img[0] == img_xref:
+                width: int = img[2]
+                height: int = img[3]
+                scale: float = (
+                    72 / dpi
+                )  # Convert pixels to points based on DPI
+                rect: fitz.Rect = fitz.Rect(
+                    0, 0, width * scale, height * scale
+                )
+
+                # Check and adjust the rectangle to fit within the page bounds if necessary
+                if (
+                    rect.width > page.rect.width
+                    or rect.height > page.rect.height
+                ):
+                    scaling_factor: float = min(
+                        page.rect.width / rect.width,
+                        page.rect.height / rect.height,
+                    )
+                    rect = fitz.Rect(
+                        0,
+                        0,
+                        rect.width * scaling_factor,
+                        rect.height * scaling_factor,
+                    )
+
+                return rect
+        return None
+    except Exception as e:  # pylint: disable=broad-except
+        logging.error(
+            "Failed to calculate image rectangle for xref %d: %s",
+            img_xref,
+            str(e),
+        )
+        return None
+
+
+def replace_image_with_vector(
+    doc: fitz.Document, img_xref: int, page_number: int, grayscale: bool
+) -> None:
+    """
+    Replaces an image in a PyMuPDF Document with vector graphics.
+
+    Args:
+        doc: The PyMuPDF Document containing the image to replace.
+        img_xref: The cross-reference number of the image.
+        page_number: The page number where the image is located.
+        grayscale: A boolean indicating whether to convert the image
+                   to grayscale.
+
+    Returns:
+        None
+    """
+
+    page: fitz.Page = doc[page_number]
+    base_image: fitz.Pixmap = fitz.Pixmap(doc, img_xref)
+
+    if grayscale and base_image.n > 2:
+        base_image = fitz.Pixmap(fitz.csGRAY, base_image)
+
+    image_bytes: bytes = base_image.tobytes("png")
+    temp_image_path: str = tempfile.mktemp(suffix=".png")
+    temp_svg_path: str = tempfile.mktemp(suffix=".svg")
+    temp_pdf_path: str = tempfile.mktemp(suffix=".pdf")
+
+    try:
+        with open(temp_image_path, "wb") as img_file:
+            img_file.write(image_bytes)
+
+        img_rect: Optional[fitz.Rect] = get_image_rect(
+            page, img_xref, temp_image_path
+        )
+        if img_rect is not None:
+            convert_image_to_svg(temp_image_path, temp_svg_path)
+            render_svg_to_pdf(temp_svg_path, temp_pdf_path)
+
+            vector_pdf: fitz.Document = fitz.open(  # type: ignore # pylance: disable=reportAttributeAccessIssue
+                temp_pdf_path
+            )
+            vector_pdf.close()
+        else:
+            logging.warning(
+                "No valid rectangle found for image xref %d on page %d",
+                img_xref,
+                page_number,
+            )
+
+    finally:
+        for path in [temp_image_path, temp_svg_path, temp_pdf_path]:
+            if os.path.exists(path):
+                os.remove(path)
+
+
+def convert_image_to_svg(input_path: str, output_path: str) -> None:
+    """
+    Converts an image file to an SVG file using Inkscape.
+
+    Args:
+        input_path: The path to the input image file.
+        output_path: The path to save the converted SVG file.
+
+    Returns:
+        None
+
+    Raises:
+        subprocess.CalledProcessError: If there is an error during
+                                       the conversion process.
+    """
+
+    inkscape_path: str = "inkscape"
+    command: List[str] = [
+        inkscape_path,
+        input_path,
+        "--export-type=svg",
+        "--export-plain-svg",
+        "--export-filename",
+        output_path,
+    ]
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        logging.error("Error converting image to SVG: %s", e)
+        logging.error("Inkscape output: %s\n%s", e.stdout, e.stderr)
+        raise
+
+
+def render_svg_to_pdf(svg_path: str, pdf_path: str) -> None:
+    """
+    Renders an SVG file to a PDF file.
+
+    Args:
+        svg_path: The path to the SVG file.
+        pdf_path: The path to save the rendered PDF file.
+
+    Returns:
+        None
+    """
+
+    if drawing := svg2rlg(svg_path):
+        renderPDF.drawToFile(drawing, pdf_path)
+
+
+def process_image(args: Tuple[fitz.Document, int, int, bool]) -> None:
+    """
+    Processes an image in a PyMuPDF Document by replacing it with
+    vector graphics.
+
+    Args:
+        args: A tuple containing the PyMuPDF Document, image xref,
+              page number, and grayscale flag.
+
+    Returns:
+        None
+
+    Raises:
+        ImageProcessingError: If there is an error during image processing.
+    """
+
+    doc: fitz.Document
+    xref: int
+    page_num: int
+    grayscale: bool
+    doc, xref, page_num, grayscale = args
+    try:
+        replace_image_with_vector(doc, xref, page_num, grayscale)
+    except Exception as e:  # pylint: disable=broad-except
+        logging.error(
+            "Error processing image on page %d: %s", page_num, str(e)
+        )
+        logging.error(traceback.format_exc())
+        raise ImageProcessingError(
+            f"Failed to process image on page {page_num}"
+        ) from e
+
+
+def process_images(
+    doc: fitz.Document, num_threads: int, grayscale: bool
+) -> None:
+    """
+    Processes images in a PyMuPDF Document using multiple threads.
+
+    Args:
+        doc: The PyMuPDF Document containing images to process.
+        num_threads: The number of threads to use for image processing.
+        grayscale: A boolean indicating whether to convert images to grayscale.
+
+    Returns:
+        None
+    """
+
+    image_tasks: List[Tuple[fitz.Document, int, int, bool]] = []
+
+    for page_num in range(  # pylint: disable=consider-using-enumerate
+        len(doc)
+    ):
+        page: fitz.Page = doc[page_num]
+        image_tasks.extend(
+            (doc, img[0], page_num, grayscale)
+            for img in page.get_images(full=True)
+        )
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=num_threads
+    ) as executor:
+        list(executor.map(process_image, image_tasks))
+
+
+def get_text_from_page(page: fitz.Page) -> str:
+    """
+    Extracts text content from a PyMuPDF Page.
+
+    Args:
+        page: The PyMuPDF Page object to extract text from.
+
+    Returns:
+        The extracted text content as a string.
+    """
+
+    return page.get_text()  # type: ignore  # pylint: disable=no-member  # pylance: disable=reportAttributeAccessIssue
+
+
+def simplify_vector_path(
+    points: List[Tuple[float, float]], epsilon: float
+) -> List[Tuple[float, float]]:
+    """
+    Simplifies a vector path by reducing the number of points
+    based on the given epsilon value.
+
+    Args:
+        points: The list of points defining the vector path.
+        epsilon: The epsilon value for simplification.
+
+    Returns:
+        The simplified list of points for the vector path.
+    """
+
+    if len(points) < 3:
+        return points
+
+    def point_line_distance(
+        point: Tuple[float, float],
+        start: Tuple[float, float],
+        end: Tuple[float, float],
+    ) -> float:
+        if start == end:
+            return math.hypot(point[0] - start[0], point[1] - start[1])
+        n: float = abs(
+            (end[0] - start[0]) * (start[1] - point[1])
+            - (start[0] - point[0]) * (end[1] - start[1])
+        )
+        d: float = math.hypot(end[0] - start[0], end[1] - start[1])
+        return n / d
+
+    dmax: float = 0.0
+    index: int = 0
+    for i in range(1, len(points) - 1):
+        d: float = point_line_distance(points[i], points[0], points[-1])
+        if d > dmax:
+            index: int = i
+            dmax = d
+
+    if dmax > epsilon:
+        results1: List[Tuple[float, float]] = simplify_vector_path(
+            points[: index + 1], epsilon
+        )
+        results2: List[Tuple[float, float]] = simplify_vector_path(
+            points[index:], epsilon
+        )
+        results: List[Tuple[float, float]] = results1[:-1] + results2
+    else:
+        results: List[Tuple[float, float]] = [points[0], points[-1]]
+
+    return results
+
+
+def extreme_vector_optimization(
+    page: fitz.Page, epsilon: float
+) -> Tuple[int, int]:
+    """
+    Performs extreme vector path optimization on a PyMuPDF Page.
+
+    Args:
+        page: The PyMuPDF Page object to optimize.
+        epsilon: The epsilon value for simplifying vector paths.
+
+    Returns:
+        A tuple containing the total number of points
+        before and after optimization.
+    """
+
+    shape: Any = page.new_shape()  # type: ignore  # pylint: disable=no-member  # pylance: disable=reportAttributeAccessIssue
+    total_points_before: int = 0
+    total_points_after: int = 0
+    for path in page.get_drawings():
+        if path["type"] in ["l", "c"]:  # line or curve
+            points = path["pts"]
+            total_points_before += len(points)
+            simplified_points: List[
+                Tuple[float, float]
+            ] = simplify_vector_path(points, epsilon)
+            total_points_after += len(simplified_points)
+            if path["type"] == "l" and len(simplified_points) >= 2:
+                shape.draw_polyline(simplified_points)
+            elif path["type"] == "c" and len(simplified_points) >= 4:
+                shape.draw_bezier(simplified_points)
+        elif path["type"] in ["f", "s"]:  # fill or stroke
+            shape.finish(fill=path["type"] == "f", color=path.get("color"))
+        elif path["type"] == "e":  # ellipse
+            rect = fitz.Rect(path["rect"])
+            shape.draw_oval(rect)
+
+    shape.commit()
+    return total_points_before, total_points_after
+
+
+def get_image_from_page(page: fitz.Page) -> Image.Image:
+    """
+    Extracts an image from a PyMuPDF Page and returns it as a PIL Image.
+
+    Args:
+        page: The PyMuPDF Page object to extract the image from.
+
+    Returns:
+        The extracted image as a PIL Image.
+    """
+
+    pix: Any = page.get_pixmap()  # type: ignore  # pylint: disable=no-member  # pylance: disable=reportAttributeAccessIssue
+    return Image.open(io.BytesIO(pix.tobytes("png")))
+
+
+def image_similarity(img1: Image.Image, img2: Image.Image) -> float:
+    """
+    Calculates the structural similarity index between two images.
+
+    Args:
+        img1: The first image as a PIL Image.
+        img2: The second image as a PIL Image.
+
+    Returns:
+        The structural similarity index between the two images.
+    """
+
+    # Convert images to grayscale
+    img1_gray: Image.Image = img1.convert("L")
+    img2_gray: Image.Image = img2.convert("L")
+
+    # Ensure images are the same size
+    if img1_gray.size != img2_gray.size:
+        img2_gray: Image.Image = img2_gray.resize(img1_gray.size)
+
+    # Convert to numpy arrays
+    img1_array: np.ndarray[Any, np.dtype[Any]] = np.array(img1_gray)
+    img2_array: np.ndarray[Any, np.dtype[Any]] = np.array(img2_gray)
+
+    # Compute SSIM
+    similarity: Any
+    _: Any
+    similarity, _ = ssim(img1_array, img2_array, full=True)
+    return similarity
+
+
+def _calculate_ei(
+    mu: Union[np.ndarray, Tuple],
+    mu_sample_opt: Any,
+    xi: float,
+    sigma: Union[np.ndarray, Any],
+) -> Union[np.ndarray, Any]:
+    """
+    Calculates the expected improvement values for Bayesian optimization
+    based on the Gaussian Process Regressor predictions.
+
+    Args:
+        mu: The mean predictions from the Gaussian Process Regressor.
+        mu_sample_opt: The maximum mean prediction from the sample.
+        xi: The exploration-exploitation trade-off parameter.
+        sigma: The standard deviation predictions from the Gaussian Process Regressor.
+
+    Returns:
+        The expected improvement values.
+    """
+
+    imp: Union[np.ndarray, Tuple]
+    result: Union[np.ndarray, Any]
+    imp = mu - mu_sample_opt - xi
+    z: np.ndarray[Any, np.dtype[Any]] = np.divide(
+        imp, sigma, out=np.zeros_like(sigma), where=sigma != 0
+    )
+    result = imp * norm.cdf(z) + sigma * norm.pdf(z)
+    result[sigma == 0.0] = 0.0
+
+    return result
+
+
+def expected_improvement(
+    x: np.ndarray,
+    x_sample: np.ndarray,
+    _y_sample: np.ndarray,
+    gpr: GaussianProcessRegressor,
+    xi: float = 0.01,
+) -> np.ndarray:
+    """
+    Calculates the expected improvement for Bayesian optimization
+    based on the Gaussian Process Regressor predictions.
+
+    Args:
+        x: The input sample.
+        x_sample: The input samples.
+        _y_sample: The output values (not used in the function).
+        gpr: The Gaussian Process Regressor for prediction.
+        xi: The exploration-exploitation trade-off parameter (default is 0.01).
+
+    Returns:
+        The expected improvement values.
+    """
+
+    mu: Union[np.ndarray, Tuple]
+    sigma: Union[np.ndarray, Any]
+    mu_sample: Union[np.ndarray, Tuple]
+
+    mu, sigma = gpr.predict(x.reshape(-1, 1), return_std=True)  # type: ignore # pylance: disable=reportAssignmentType
+    mu_sample = gpr.predict(x_sample)
+
+    sigma = sigma.reshape(-1, 1)  # pylance: disable=reportAttributeAccessIssue
+    mu_sample_opt: Any = np.max(mu_sample)
+
+    with np.errstate(divide="warn"):
+        ei: Union[np.ndarray, Any] = _calculate_ei(
+            mu, mu_sample_opt, xi, sigma
+        )
+    return ei.ravel()
+
+
+def propose_location(
+    acquisition: Callable[..., np.ndarray],
+    x_sample: np.ndarray,
+    y_sample: np.ndarray,
+    gpr: GaussianProcessRegressor,
+    bounds: np.ndarray,
+    n_restarts: int = 25,
+) -> Optional[np.ndarray]:
+    """
+    Proposes the next sample location for Bayesian optimization
+    based on the acquisition function.
+
+    Args:
+        acquisition: The acquisition function to determine the next sample location.
+        x_sample: The input samples.
+        y_sample: The output values.
+        gpr: The Gaussian Process Regressor.
+        bounds: The bounds within which to propose the next sample.
+        n_restarts: The number of restarts for optimization (default is 25).
+
+    Returns:
+        The proposed next sample location
+        or None if proposing the next sample fails.
+    """
+
+    min_val = float("inf")
+    min_x: Optional[np.ndarray] = None
+
+    def min_obj(x: np.ndarray) -> np.ndarray:
+        return -acquisition(x.reshape(1, -1), x_sample, y_sample, gpr).ravel()
+
+    for x0 in np.random.uniform(
+        bounds[:, 0], bounds[:, 1], size=(n_restarts, 1)
+    ):
+        res: OptimizeResult = minimize(min_obj, x0=x0, bounds=bounds, method="L-BFGS-B")
+        if res.fun < min_val:
+            min_val = res.fun
+            min_x = res.x
+
+    return min_x
+
+
+def bayesian_optimization(
+    objective: Callable[[float], float],
+    bounds: np.ndarray,
+    n_iterations: int,
+    n_initial: int = 5,
+) -> Tuple[float, float]:
+    """
+    Performs Bayesian optimization to find the optimal value
+    for a given objective function within specified bounds.
+
+    Args:
+        objective: The objective function to optimize.
+        bounds: The bounds within which to search for the optimal value.
+        n_iterations: The number of optimization iterations.
+        n_initial: The number of initial samples (default is 5).
+
+    Returns:
+        A tuple containing the optimal value and the corresponding
+        objective function value.
+    """
+
+    dim: int = bounds.shape[0]
+    x_sample: np.ndarray[Any, np.dtype[np.floating]] = np.random.uniform(
+        bounds[:, 0], bounds[:, 1], size=(n_initial, dim)
+    )
+    y_sample: np.ndarray = np.array([objective(x[0]) for x in x_sample])
+
+    kernel: Sum = Matern(
+        nu=2.5, length_scale=1.0, length_scale_bounds=(1e-2, 1e5)
+    ) + WhiteKernel(noise_level=1e-5, noise_level_bounds=(1e-12, 1e2))
+    gpr = GaussianProcessRegressor(
+        kernel=kernel, n_restarts_optimizer=25, random_state=42
+    )
+
+    for i in range(n_iterations):
+        gpr.fit(x_sample, y_sample)
+
+        next_sample: Union[np.ndarray, None] = propose_location(
+            expected_improvement, x_sample, y_sample, gpr, bounds
+        )
+
+        if next_sample is None:
+            logging.warning(
+                "Optimization stopped at iteration %d due to failure in proposing next sample.",
+                (i + 1),
+            )
+            break
+
+        next_sample = next_sample.ravel()
+        next_objective: float = objective(next_sample[0])
+        logging.info(
+            "Iteration %d/%d: epsilon = %.4f, similarity = %.4f",
+            i + 1,
+            n_iterations,
+            next_sample[0],
+            next_objective,
+        )
+
+        x_sample = np.vstack((x_sample, next_sample))
+        y_sample = np.append(y_sample, next_objective)
+
+    best_idx: np.signedinteger = np.argmax(y_sample)
+    return x_sample[best_idx, 0], y_sample[best_idx]
+
+
+def find_optimal_vector_simplification(
+    doc: fitz.Document,
+    min_epsilon: float = 0.1,
+    max_epsilon: float = 10.0,
+    n_iterations: int = 20,
+    sample_size: int = 5,
+    similarity_threshold: float = 0.8,
+) -> float:
+    """
+    Finds the optimal vector simplification epsilon value for a PyMuPDF Document
+    using Bayesian optimization.
+
+    Args:
+        doc: The PyMuPDF Document to optimize.
+        min_epsilon: The minimum epsilon value for vector simplification (default is 0.1).
+        max_epsilon: The maximum epsilon value for vector simplification (default is 10.0).
+        n_iterations: The number of iterations for Bayesian optimization (default is 20).
+        sample_size: The number of pages to sample for optimization and comparison (default is 5).
+        similarity_threshold: The similarity threshold for optimal results (default is 0.8).
+
+    Returns:
+        The optimal vector simplification epsilon value.
+    """
+
+    try:
+        num_pages: int = len(doc)
+        sample_pages: List[int] = sorted(
+            random.sample(range(num_pages), min(sample_size, num_pages))
+        )
+
+        # Check if there's any vector content to optimize
+        initial_similarity: float
+        _: Any
+        _, initial_similarity = optimize_and_compare(
+            doc, min_epsilon, sample_pages
+        )
+        if initial_similarity == 1.0:
+            logging.info(
+                "No vector content to optimize. Skipping vector simplification."
+            )
+            return min_epsilon
+    except Exception as e:  # pylint: disable=broad-except
+        logging.error(
+            "Error in find_optimal_vector_simplification: %s", str(e)
+        )
+        logging.error("Traceback: %s", traceback.format_exc())
+        raise VectorOptimizationError(
+            "Failed to find optimal vector simplification"
+        ) from e
+
+    def objective(epsilon: float) -> float:
+        """
+        Calculates the objective function value based on the similarity
+        ratio obtained from optimizing and comparing a PyMuPDF Document.
+
+        Args:
+            epsilon: The vector simplification epsilon value to evaluate.
+
+        Returns:
+            The similarity ratio calculated as the objective function value.
+        """
+
+        try:
+            similarity: float
+            _: Any
+            _, similarity = optimize_and_compare(doc, epsilon, sample_pages)
+            logging.info(
+                "Objective evaluation: epsilon = %.4f, similarity = %.4f",
+                epsilon,
+                similarity,
+            )
+            return similarity
+        except Exception as e:  # pylint: disable=broad-except
+            logging.error("Error in objective function: %s", str(e))
+            return 0.0
+
+    logging.info("Starting Bayesian optimization for vector simplification")
+
+    try:
+        bounds: np.ndarray = np.array([[min_epsilon, max_epsilon]])
+        best_epsilon: float
+        best_similarity: float
+        best_epsilon, best_similarity = bayesian_optimization(
+            objective, bounds, n_iterations
+        )
+
+        logging.info(
+            "Optimization complete. Best epsilon: %.4f, Best similarity: %.4f",
+            best_epsilon,
+            best_similarity,
+        )
+
+        if best_similarity < similarity_threshold:
+            logging.warning(
+                "Best similarity (%.4f) is below the threshold (%.4f). Results may not be optimal.",
+                best_similarity,
+                similarity_threshold,
+            )
+
+        return float(best_epsilon)
+    except Exception as e:  # pylint: disable=broad-except
+        logging.error(
+            "Error in find_optimal_vector_simplification: %s", str(e)
+        )
+        logging.error("Traceback: %s", traceback.format_exc())
+        return min_epsilon
+
+
+def optimize_and_compare(
+    doc: fitz.Document, epsilon: float, sample_pages: List[int]
+) -> Tuple[Any, float]:
+    """
+    Optimizes vector paths on selected pages of a PyMuPDF Document and
+    compares the optimization results.
+
+    Args:
+        doc: The PyMuPDF Document to optimize and compare.
+        epsilon: The vector simplification epsilon value.
+        sample_pages: The list of page numbers to sample for optimization
+                      and comparison.
+
+    Returns:
+        A tuple containing the epsilon value and the similarity ratio of 
+        points after and before optimization.
+    """
+
+    temp_doc: fitz.Document = fitz.open()  # type: ignore  # pylint: disable=no-member  # pylance: disable=reportAttributeAccessIssue
+    temp_doc.insert_pdf(
+        doc, from_page=min(sample_pages), to_page=max(sample_pages)
+    )
+
+    total_points_before: int = 0
+    total_points_after: int = 0
+
+    for page in temp_doc:
+        points_before: int
+        points_after: int
+        points_before, points_after = extreme_vector_optimization(
+            page, epsilon
+        )
+        total_points_before += points_before
+        total_points_after += points_after
+
+    if total_points_before == 0:
+        similarity: float = 1.0
+    else:
+        similarity: float = total_points_after / total_points_before
+
+    return epsilon, similarity
+
+
+def get_used_characters(doc: fitz.Document) -> Set[str]:
+    """
+    Gets the set of used characters from a PyMuPDF Document.
+
+    Args:
+        doc: The PyMuPDF Document object to extract used characters from.
+
+    Returns:
+        A set of characters used in the document.
+    """
+
+    used_chars: Set[str] = set()
+    for page in doc:
+        text: str = (
+            page.get_text()  # type: ignore  # pylint: disable=no-member  # pylance: disable=reportAttributeAccessIssue
+        )
+        used_chars.update(set(text))
+    return used_chars
+
+
+def aggressive_font_subset(pdf: pikepdf.Pdf, used_chars: Set[str]) -> None:
+    """
+    Performs aggressive font subsetting on a PyMuPDF Pdf object based on
+    the used characters.
+
+    Args:
+        pdf: The PyMuPDF Pdf object to subset fonts in.
+        used_chars: A set of characters used in the PDF.
+
+    Returns:
+        None
+
+    Raises:
+        FontSubsettingError: If there is an error during font subsetting.
+    """
+
+    for page in pdf.pages:
+        if "/Resources" in page and "/Font" in page["/Resources"]:
+            fonts: pikepdf.Object = page["/Resources"]["/Font"]
+            for _font_key, font in fonts.items():
+                if "/FontDescriptor" in font:
+                    descriptor: pikepdf.Object = font["/FontDescriptor"]
+                    for key in ["/FontFile", "/FontFile2", "/FontFile3"]:
+                        if key in descriptor:
+                            font_file: pikepdf.Object = descriptor[key]
+                            if isinstance(font_file, pikepdf.Stream):
+                                font_data: bytes = font_file.read_bytes()
+                                try:
+                                    ttfont: TTFont = TTFont(
+                                        io.BytesIO(font_data)
+                                    )
+                                    subsetter: subset.Subsetter = (
+                                        subset.Subsetter()
+                                    )
+                                    subsetter.populate(
+                                        text="".join(used_chars)
+                                    )
+                                    subsetter.subset(ttfont)
+                                    new_font_buffer: io.BytesIO = io.BytesIO()
+                                    ttfont.save(new_font_buffer)
+                                    new_font_data: bytes = (
+                                        new_font_buffer.getvalue()
+                                    )
+                                    descriptor[key] = pikepdf.Stream(
+                                        pdf, new_font_data
+                                    )
+                                except Exception as e:  # pylint: disable=broad-except
+                                    logging.error(
+                                        "Error subsetting font: %s", e
+                                    )
+                                    raise FontSubsettingError(
+                                        f"Failed to subset font: {str(e)}"
+                                    ) from e
+
+
+def remove_metadata(pdf: pikepdf.Pdf) -> None:
+    """
+    Removes metadata from a PyMuPDF Pdf object.
+
+    Args:
+        pdf: The PyMuPDF Pdf object from which metadata needs to be removed.
+
+    Returns:
+        None
+    """
+
+    with pdf.open_metadata() as meta:
+        meta.clear()
+    if pdf.Root.get("/Metadata") is not None:
+        del pdf.Root["/Metadata"]
+
+
+def clean_pdf(pdf: pikepdf.Pdf) -> None:
+    """
+    Cleans up a PyMuPDF Pdf object by removing unreferenced resources
+    and indirect objects from pages.
+
+    Args:
+        pdf: The PyMuPDF Pdf object to be cleaned.
+
+    Returns:
+        None
+    """
+
+    pdf.remove_unreferenced_resources()
+    for page in pdf.pages:
+        if "/Resources" in page:
+            resources: pikepdf.Object = page["/Resources"]
+            for resource_type in [
+                "/XObject",
+                "/ExtGState",
+                "/Pattern",
+                "/Shading",
+            ]:
+                if resource_type in resources:
+                    resource_dict: pikepdf.Object = resources[resource_type]
+                    keys_to_delete: List[str] = []
+                    for key, value in resource_dict.items():
+                        if value.is_indirect:
+                            try:
+                                _: pikepdf.Object = pdf.get_object(value.objgen)
+                            except KeyError:
+                                keys_to_delete.append(key)
+                    for key in keys_to_delete:
+                        del resource_dict[key]
+
+
+def flatten_annotations(doc: fitz.Document) -> None:
+    """
+    Flattens annotations in a PyMuPDF Document.
+
+    Args:
+        doc: The PyMuPDF Document object containing annotations
+        to be flattened.
+
+    Returns:
+        None
+    """
+
+    for page in doc:
+        for annot in page.annots():
+            if annot.type[0] in [
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+            ]:  # Form fields and annotations
+                page.add_redact_annot(annot.rect)
+                page.apply_redactions()  # type: ignore  # pylint: disable=no-member  # pylance: disable=reportAttributeAccessIssue
+
+
+@lru_cache(maxsize=1000)
+def optimize_content_stream(content: bytes) -> bytes:
+    """
+    Optimizes a content stream by removing empty lines
+    and lines starting with '%'.
+
+    Args:
+        content: The content stream bytes to be optimized.
+
+    Returns:
+        The optimized content stream bytes.
+    """
+
+    return b"\n".join(
+        line
+        for line in content.split(b"\n")
+        if line.strip() and not line.strip().startswith(b"%")
+    )
+
+
+def process_content(content: bytes) -> bytes:
+    """
+    Optimizes the content streams of a PDF.
+
+    Args:
+        pdf: The PDF object whose content streams need to be optimized.
+
+    Returns:
+        None
+
+    Raises:
+        ContentOptimizationError: If there is an error during content stream
+        optimization.
+    """
+
+    return optimize_content_stream(content)
+
+
+def optimize_pdf_contents(pdf: pikepdf.Pdf) -> None:
+    """
+    Performs extreme optimization on a PDF file.
+
+    Args:
+        input_file: The path to the input PDF file.
+        output_file: The path to save the optimized PDF file.
+        num_threads: The number of threads to use for image processing.
+        grayscale: A boolean indicating whether to convert images to grayscale.
+        flatten: A boolean indicating whether to flatten annotations.
+
+    Returns:
+        None
+
+    Raises:
+        FileAccessError: If the input file is not found.
+        PDFProcessingError: If any error occurs during the PDF optimization
+                            process.
+    """
+
+    with multiprocessing.Pool() as pool:
+        for page in pdf.pages:
+            if "/Contents" in page:
+                contents: pikepdf.Object = page["/Contents"]
+                try:
+                    if isinstance(contents, pikepdf.Stream):
+                        optimized = pool.apply_async(
+                            process_content, (contents.read_bytes(),)
+                        )
+                        page["/Contents"] = pikepdf.Stream(
+                            pdf, optimized.get()
+                        )
+                    elif isinstance(contents, pikepdf.Array):
+                        optimized_contents: List[pikepdf.Stream] = []
+                        for content in contents:  # type: ignore
+                            if isinstance(content, pikepdf.Stream):
+                                optimized: ApplyResult = pool.apply_async(
+                                    process_content, (content.read_bytes(),)
+                                )
+                                optimized_contents.append(
+                                    pikepdf.Stream(pdf, optimized.get())
+                                )
+                        page["/Contents"] = pikepdf.Array(optimized_contents)
+                except Exception as e:  # pylint: disable=broad-except
+                    raise ContentOptimizationError(
+                        f"Failed to optimize content stream: {str(e)}"
+                    ) from e
+
+
+def extreme_pdf_optimization(
+    input_file: str,
+    output_file: str,
+    num_threads: int,
+    grayscale: bool,
+    flatten: bool,
+) -> None:
+    """
+    Performs extreme optimization on a PDF file.
+
+    Args:
+        input_file: The path to the input PDF file.
+        output_file: The path to save the optimized PDF file.
+        num_threads: The number of threads to use for image processing.
+        grayscale: A boolean indicating whether to convert images to grayscale.
+        flatten: A boolean indicating whether to flatten annotations.
+
+    Returns:
+        None
+
+    Raises:
+        FileAccessError: If the input file is not found.
+        PDFProcessingError: If any error occurs during the PDF optimization
+                            process.
+    """
+
+    try:
+        logging.info("Opening PDF: %s", input_file)
+
+        if not os.path.exists(input_file):
+            raise FileAccessError(f"Input file not found: {input_file}")
+
+        with tempfile.NamedTemporaryFile(
+            delete=False, suffix=".pdf"
+        ) as temp_pdf:
+            temp_pdf_path: str = temp_pdf.name
+
+        shutil.copy2(input_file, temp_pdf_path)
+
+        pdf: pikepdf.Pdf = pikepdf.open(temp_pdf_path)
+        doc: fitz.Document = fitz.open(temp_pdf_path)  # type: ignore # pylance: disable=reportAttributeAccessIssue
+
+        logging.info("Collecting used characters...")
+        used_chars: Set[str] = get_used_characters(doc)
+
+        logging.info("Aggressively subsetting fonts...")
+        aggressive_font_subset(pdf, used_chars)
+
+        logging.info("Removing metadata...")
+        remove_metadata(pdf)
+
+        logging.info("Cleaning PDF...")
+        clean_pdf(pdf)
+
+        if flatten:
+            logging.info("Flattening annotations...")
+            flatten_annotations(doc)
+
+        logging.info("Optimizing content streams...")
+        optimize_pdf_contents(pdf)
+
+        with tempfile.NamedTemporaryFile(
+            delete=False, suffix=".pdf"
+        ) as temp_pdf2:
+            temp_pdf_path2: str = temp_pdf2.name
+
+        pdf.save(temp_pdf_path2)
+        pdf.close()
+
+        doc = fitz.open(temp_pdf_path2)  # type: ignore # pylance: disable=reportAttributeAccessIssue
+
+        logging.info("Finding optimal vector simplification epsilon...")
+        optimal_epsilon: float = find_optimal_vector_simplification(doc)
+        if optimal_epsilon > 0.0:
+            logging.info(
+                "Optimal vector simplification epsilon: %d", optimal_epsilon
+            )
+
+            logging.info("Extremely optimizing vector paths...")
+            for page in doc:
+                page.clean_contents(sanitize=True)
+                extreme_vector_optimization(page, optimal_epsilon)
+
+        logging.info("Aggressively optimizing images...")
+        process_images(doc, num_threads=num_threads, grayscale=grayscale)
+
+        with tempfile.NamedTemporaryFile(
+            delete=False, suffix=".pdf"
+        ) as temp_pdf3:
+            temp_pdf_path3: str = temp_pdf3.name
+
+        doc.save(temp_pdf_path3, garbage=4, deflate=True, clean=True)
+        doc.close()
+
+        logging.info("Applying final optimizations...")
+        gs_params: List[str] = [
+            "-sDEVICE=pdfwrite",
+            "-dCompatibilityLevel=1.5",
+            "-dPDFSETTINGS=/screen",
+            "-dColorImageDownsampleType=/Bicubic",
+            "-dColorImageResolution=72",
+            "-dGrayImageDownsampleType=/Bicubic",
+            "-dGrayImageResolution=72",
+            "-dMonoImageDownsampleType=/Bicubic",
+            "-dMonoImageResolution=72",
+            "-dNOPAUSE",
+            "-dQUIET",
+            "-dBATCH",
+            "-dEmbedAllFonts=true",
+            "-dSubsetFonts=true",
+            "-dCompressFonts=true",
+            "-dOptimize=true",
+            "-dUseFlateCompression=true",
+            "-dAutoFilterColorImages=false",
+            "-dAutoFilterGrayImages=false",
+            "-dDownsampleMonoImages=false",
+            "-dDownsampleGrayImages=false",
+            "-dDownsampleColorImages=false",
+        ]
+        try:
+            subprocess.run(
+                ["gs"]
+                + gs_params
+                + [f"-sOutputFile={output_file}", temp_pdf_path3],
+                check=True,
+            )
+
+            os.remove(temp_pdf_path)
+            os.remove(temp_pdf_path2)
+            os.remove(temp_pdf_path3)
+        except subprocess.CalledProcessError as e:
+            raise PDFProcessingError(
+                f"Ghostscript optimization failed: {e.stderr}"
+            ) from e
+
+        logging.info(
+            "Extreme optimization complete. Final file: %s", output_file
+        )
+    except Exception as e:  # pylint: disable=broad-except
+        logging.error("Error optimizing PDF: %s", str(e))
+        logging.error(traceback.format_exc())
+        raise PDFProcessingError("PDF optimization failed") from e
+
+
+def run(args) -> None:
+    """
+    Runs the PDF optimization process based on the provided arguments.
+
+    Args:
+        args: The arguments used for optimization.
+
+    Returns:
+        None
+    """
+
+    extreme_pdf_optimization(
+        args.input_file,
+        args.output_file,
+        args.threads,
+        args.grayscale,
+        args.flatten,
+    )
+
+    original_size: int = os.path.getsize(args.input_file)
+    optimized_size: int = os.path.getsize(args.output_file)
+    reduction_percentage: float = (1 - optimized_size / original_size) * 100
+    logging.info("Original size: %d bytes", original_size)
+    logging.info("Optimized size: %d bytes", optimized_size)
+    logging.info("Size reduction: %.2f%%", reduction_percentage)
+
+
+def optimize(args) -> None:
+    """
+    Optimizes the PDF file based on the provided arguments.
+
+    Args:
+        args: The arguments used for optimization.
+
+    Returns:
+        None
+
+    Raises:
+        FileAccessError: If there is an error accessing the file.
+        PDFProcessingError: If there is an error during PDF processing.
+        Any other exception that occurs during the optimization process.
+    """
+
+    try:
+        run(args)
+    except FileAccessError as e:
+        logging.error("File access error: %s", str(e))
+        sys.exit(1)
+    except PDFProcessingError as e:
+        logging.error("PDF processing error: %s", str(e))
+        sys.exit(1)
+    except Exception as e:  # pylint: disable=broad-except
+        logging.error("An unexpected error occurred: %s", str(e))
+        logging.error(traceback.format_exc())
+        sys.exit(1)
+
+
+def main() -> None:
+    """
+    Runs the main optimization process.
+
+    Args:
+        args: The parsed command-line arguments.
+
+    Returns:
+        None
+
+    Raises:
+        Any exception that occurs during the optimization process.
+    """
+
+    args: argparse.Namespace = parse_arguments()
+    try:
+        optimize(args)
+    except Exception as e:  # pylint: disable=broad-except
+        logging.error("An unexpected error occurred: %s", str(e))
+        logging.error(traceback.format_exc())
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
