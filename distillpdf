@@ -57,8 +57,6 @@ Author:
 License:
     This script is licensed under the GNU Affero General Public License v3.0
 """
-
-from ast import Bytes
 from multiprocessing.pool import ApplyResult
 import os
 import sys
@@ -543,7 +541,7 @@ def replace_image(
         if temp_image_path and os.path.exists(temp_image_path):
             try:
                 os.remove(temp_image_path)
-            except Exception as e:
+            except Exception as e:  # pylint: disable=broad-except
                 logging.warning(
                     "Failed to remove temporary file %s: %s",
                     temp_image_path,
@@ -571,7 +569,7 @@ def _log_process_image_pdf_processing_error(
     logging.debug("Image xref: %i", xref)
     logging.debug("Cause: %s", str(e.__cause__))
     logging.debug("Context: %s", e.context)
-    logging.info(f"Keeping the original image {xref}.")
+    logging.info("Keeping the original image %d.", xref)
 
 
 def process_image(args: Tuple[fitz.Document, int, int, str, bool]) -> None:
@@ -591,14 +589,14 @@ def process_image(args: Tuple[fitz.Document, int, int, str, bool]) -> None:
         replace_image(doc, xref, page_num, image_path, grayscale)
     except PDFProcessingError as e:
         _log_process_image_pdf_processing_error(page_num, e, xref)
-    except Exception as e:
+    except Exception as e:  # pylint: disable=broad-except
         logging.error(
             "Unexpected error while processing image from page %d: %s",
             page_num,
             str(e),
         )
         logging.debug("Traceback: %s", traceback.format_exc())
-        logging.info(f"Keeping original image {xref}")
+        logging.info("Keeping original image %d", xref)
 
 
 def process_images(
@@ -1047,7 +1045,7 @@ def find_optimal_vector_simplification(
                 similarity,
             )
             return similarity
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-except
             logging.error("Error in objective function: %s", str(e))
             return 0.0
 
@@ -1567,7 +1565,7 @@ def optimize(args: argparse.Namespace) -> None:
     except PDFProcessingError as e:
         logging.error("PDF processing error: %s", str(e))
         sys.exit(1)
-    except Exception as e:
+    except Exception as e:  # pylint: disable=W0703
         logging.error("An unexpected error occurred: %s", str(e))
         logging.error(traceback.format_exc())
         sys.exit(1)
@@ -1578,7 +1576,7 @@ def main() -> None:
     args: argparse.Namespace = parse_arguments()
     try:
         optimize(args)
-    except Exception as e:
+    except Exception as e:  # pylint: disable=W0703
         logging.error("An unexpected error occurred: %s", str(e))
         logging.error(traceback.format_exc())
         sys.exit(1)
