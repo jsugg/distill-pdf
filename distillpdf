@@ -168,11 +168,15 @@ class ContentOptimizationError(PDFProcessingError):
     """Exception raised for errors during content stream optimization."""
 
 
+## File Management
+
 class AdaptiveSemaphore:
     def __init__(self, initial_value: int, max_value: int) -> None:
         self.semaphore: Semaphore = multiprocessing.Semaphore(initial_value)
         self.max_value: int = max_value
-        self.current_value: Synchronized[Any] = multiprocessing.Value('i', initial_value)
+        self.current_value: Synchronized[Any] = multiprocessing.Value(
+            "i", initial_value
+        )
 
     def acquire(self) -> None:
         self.semaphore.acquire()
@@ -195,6 +199,7 @@ class AdaptiveSemaphore:
             with self.current_value.get_lock():
                 self.current_value.value += 1
 
+
 def with_adaptive_semaphore(func):
     @wraps(func)
     def wrapper(*args, **kwargs) -> Any:
@@ -203,16 +208,21 @@ def with_adaptive_semaphore(func):
             return func(*args, **kwargs)
         finally:
             file_semaphore.release()
+
     return wrapper
+
 
 def get_open_files_count() -> int:
     return len(psutil.Process().open_files())
+
 
 def update_semaphore_value() -> None:
     current_open_files: int = get_open_files_count()
     _, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
     available_fds: int = hard_limit - current_open_files
-    max_concurrent: int = min(int(available_fds * MAX_FD_USAGE_PERCENT / 100), cli_args.max_files)
+    max_concurrent: int = min(
+        int(available_fds * MAX_FD_USAGE_PERCENT / 100), cli_args.max_files
+    )
     file_semaphore.update_max_value(max_concurrent)
     logging.info("Updated max concurrent files to: %d", max_concurrent)
 
@@ -244,6 +254,8 @@ def create_temp_file(suffix: str) -> tempfile._TemporaryFileWrapper:
     """
     return tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
 
+
+## OCR
 
 def get_text_from_image(image: np.ndarray) -> str:
     """
@@ -303,6 +315,8 @@ def is_ocr_readable(
         ) from e
 
 
+## Image Optimization
+
 def optimize_raster_image(
     image_bytes: bytes, max_width: int = 1000, quality: int = 75
 ) -> bytes:
@@ -324,7 +338,7 @@ def optimize_raster_image(
     try:
         # pylint: disable=no-member
         nparr: np.ndarray = np.frombuffer(image_bytes, np.uint8)
-        img: MatLike = cv2.imdecode(nparr, cv2.IMREAD_UNCHANGED)  
+        img: MatLike = cv2.imdecode(nparr, cv2.IMREAD_UNCHANGED)
         h, w = img.shape[:2]
         if w > max_width:
             ratio: float = max_width / w
@@ -710,26 +724,7 @@ def process_images(
         ) from e
 
 
-def get_text_from_page(page: fitz.Page) -> str:
-    """
-    Extract text content from a PDF page.
-
-    Args:
-        page (fitz.Page): The PDF page.
-
-    Returns:
-        str: The extracted text.
-
-    Raises:
-        PDFProcessingError: If text extraction fails.
-    """
-    try:
-        return page.get_text()  # type: ignore  # pymupdf library does not expose this method
-    except Exception as e:
-        raise PDFProcessingError(
-            f"Failed to extract text from page: {str(e)}", ""
-        ) from e
-
+## Vector Path Simplification
 
 def simplify_vector_path(
     points: List[Tuple[float, float]], epsilon: float
@@ -1055,8 +1050,8 @@ def find_optimal_vector_simplification(
                                        Defaults to 0.1.
         max_epsilon (float, optional): The maximum epsilon value.
                                        Defaults to 10.0.
-        n_iterations (int, optional): The number of optimization iterations.
-                                      Defaults to 20.
+        n_iterations (int, optional): The number of optimization
+                                      iterations. Defaults to 20.
         sample_size (int, optional): The number of pages to sample.
                                      Defaults to 5.
         similarity_threshold (float, optional): The similarity threshold.
@@ -1197,6 +1192,8 @@ def optimize_and_compare(
         ) from e
 
 
+## Fonts optimization
+
 def get_used_characters(doc: fitz.Document) -> Set[str]:
     """
     Get the set of used characters from a PDF document.
@@ -1271,6 +1268,8 @@ def aggressive_font_subset(pdf: pikepdf.Pdf, used_chars: Set[str]) -> None:
                                     ) from e
 
 
+## Metadata optimization
+
 def remove_metadata(pdf: pikepdf.Pdf) -> None:
     """
     Remove metadata from a PDF object.
@@ -1283,6 +1282,8 @@ def remove_metadata(pdf: pikepdf.Pdf) -> None:
     if pdf.Root.get("/Metadata") is not None:
         del pdf.Root["/Metadata"]
 
+
+## Objects optimization
 
 def clean_pdf(pdf: pikepdf.Pdf) -> None:
     """
@@ -1327,6 +1328,9 @@ def clean_pdf(pdf: pikepdf.Pdf) -> None:
         ) from e
 
 
+## Annotations optimization
+
+
 def flatten_annotations(doc: fitz.Document) -> None:
     """
     Flatten annotations in a PDF document.
@@ -1365,6 +1369,9 @@ def flatten_annotations(doc: fitz.Document) -> None:
         raise PDFProcessingError(
             "Failed to flatten annotations", traceback.format_exc()
         ) from e
+
+
+## Content stream optimization
 
 
 @lru_cache(maxsize=1000)
@@ -1448,7 +1455,11 @@ def optimize_pdf_contents(pdf: pikepdf.Pdf) -> None:
                     ) from e
 
 
-def process_single_pdf(args: Tuple[str, str, int, bool, bool]) -> Tuple[str, int, int, float]:
+# PDF Processing
+
+def process_single_pdf(
+    args: Tuple[str, str, int, bool, bool]
+) -> Tuple[str, int, int, float]:
     """
     Process a single PDF file with retry mechanism and adaptive concurrency.
 
@@ -1462,16 +1473,33 @@ def process_single_pdf(args: Tuple[str, str, int, bool, bool]) -> Tuple[str, int
     for attempt in range(MAX_RETRIES):
         try:
             update_semaphore_value()  # Update semaphore before processing
-            original_size, optimized_size, reduction_percentage = extreme_pdf_optimization(
-                input_file, output_file, num_threads, grayscale, flatten
+            original_size, optimized_size, reduction_percentage = (
+                extreme_pdf_optimization(
+                    input_file, output_file, num_threads, grayscale, flatten
+                )
             )
-            return os.path.basename(input_file), original_size, optimized_size, reduction_percentage
+            return (
+                os.path.basename(input_file),
+                original_size,
+                optimized_size,
+                reduction_percentage,
+            )
         except OSError as e:
             if attempt < MAX_RETRIES - 1:
-                logging.warning("Attempt %d failed for %s: %s. Retrying...", attempt + 1, input_file, str(e))
+                logging.warning(
+                    "Attempt %d failed for %s: %s. Retrying...",
+                    attempt + 1,
+                    input_file,
+                    str(e),
+                )
                 time.sleep(RETRY_DELAY)
             else:
-                logging.error("Failed to process %s after %d attempts: %s", input_file, MAX_RETRIES, str(e))
+                logging.error(
+                    "Failed to process %s after %d attempts: %s",
+                    input_file,
+                    MAX_RETRIES,
+                    str(e),
+                )
                 return os.path.basename(input_file), 0, 0, 0.0
         except Exception as e:  # pylint: disable=broad-except
             logging.error("Error processing %s: %s", input_file, str(e))
@@ -1485,7 +1513,7 @@ def optimize_directory(
     output_dir: str,
     num_threads: int,
     grayscale: bool,
-    flatten: bool
+    flatten: bool,
 ) -> None:
     """
     Optimize all PDF files in the given input directory and save them to the output directory.
@@ -1507,7 +1535,9 @@ def optimize_directory(
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    pdf_files: List[str] = [f for f in os.listdir(input_dir) if f.lower().endswith('.pdf')]
+    pdf_files: List[str] = [
+        f for f in os.listdir(input_dir) if f.lower().endswith(".pdf")
+    ]
     total_files: int = len(pdf_files)
 
     logging.info("Found %d PDF files to process.", total_files)
@@ -1517,19 +1547,29 @@ def optimize_directory(
         (
             os.path.join(input_dir, pdf_file),
             os.path.join(output_dir, f"optimized_{pdf_file}"),
-            max(1, num_threads // total_files),  # Distribute threads among files
+            max(
+                1, num_threads // total_files
+            ),  # Distribute threads among files
             grayscale,
-            flatten
+            flatten,
         )
         for pdf_file in pdf_files
     ]
 
     # Use ThreadPoolExecutor for parallel processing
-    with concurrent.futures.ThreadPoolExecutor(max_workers=file_semaphore.max_value) as executor:
-        futures: List[concurrent.futures.Future[Tuple[str, int, int, float]]] = [executor.submit(process_single_pdf, args) for args in process_args]
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=file_semaphore.max_value
+    ) as executor:
+        futures: List[
+            concurrent.futures.Future[Tuple[str, int, int, float]]
+        ] = [
+            executor.submit(process_single_pdf, args) for args in process_args
+        ]
 
         for future in concurrent.futures.as_completed(futures):
-            file_name, original_size, optimized_size, reduction_percentage = future.result()
+            file_name, original_size, optimized_size, reduction_percentage = (
+                future.result()
+            )
             if original_size > 0:
                 logging.info("Processed: %s", file_name)
                 logging.info("Original size: %d bytes", original_size)
@@ -1539,8 +1579,13 @@ def optimize_directory(
                 logging.error("Failed to process: %s", file_name)
 
             # Log current semaphore value and open files count
-            logging.info("Current semaphore value: %d", file_semaphore.get_current_value())
-            logging.info("Current open files count: %d", get_open_files_count())
+            logging.info(
+                "Current semaphore value: %d",
+                file_semaphore.get_current_value(),
+            )
+            logging.info(
+                "Current open files count: %d", get_open_files_count()
+            )
 
 
 @with_adaptive_semaphore
@@ -1704,15 +1749,19 @@ def run(args: argparse.Namespace) -> None:
                 args.output_dir,
                 args.threads,
                 args.grayscale,
-                args.flatten
+                args.flatten,
             )
         else:
-            original_size, optimized_size, reduction_percentage = extreme_pdf_optimization(
-                args.input,
-                args.output,
-                args.threads,
-                args.grayscale,
-                args.flatten,
+            if args.output is None:
+                raise ValueError("Output file must be specified for single file input")
+            original_size, optimized_size, reduction_percentage = (
+                extreme_pdf_optimization(
+                    args.input,
+                    args.output,
+                    args.threads,
+                    args.grayscale,
+                    args.flatten,
+                )
             )
             logging.info("Processed: %s", os.path.basename(args.input))
             logging.info("Original size: %d bytes", original_size)
@@ -1722,7 +1771,6 @@ def run(args: argparse.Namespace) -> None:
         raise PDFProcessingError(
             "Error during PDF optimization", traceback.format_exc()
         ) from e
-
 
 
 def optimize(args: argparse.Namespace) -> None:
@@ -1752,7 +1800,9 @@ def main() -> None:
     cli_args = parse_arguments()
 
     # Set up logging
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    )
 
     # Determine the maximum number of open files allowed by the system
     _soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -1763,12 +1813,18 @@ def main() -> None:
     # Calculate the initial number of concurrent files to process
     current_open_files: int = get_open_files_count()
     available_fds: int = hard_limit - current_open_files
-    initial_concurrent_files: int = min(int(available_fds * MAX_FD_USAGE_PERCENT / 100), cli_args.max_files)
+    initial_concurrent_files: int = min(
+        int(available_fds * MAX_FD_USAGE_PERCENT / 100), cli_args.max_files
+    )
 
     # Create an adaptive semaphore
-    file_semaphore = AdaptiveSemaphore(initial_concurrent_files, cli_args.max_files)
+    file_semaphore = AdaptiveSemaphore(
+        initial_concurrent_files, cli_args.max_files
+    )
 
-    logging.info("Initial maximum concurrent files: %d", initial_concurrent_files)
+    logging.info(
+        "Initial maximum concurrent files: %d", initial_concurrent_files
+    )
     logging.info("Current open files: %d", current_open_files)
     logging.info("Available file descriptors: %d", available_fds)
 
@@ -1790,10 +1846,16 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Advanced PDF Distiller")
     parser.add_argument("input", type=str, help="Input PDF file or directory")
     parser.add_argument(
-        "--output", type=str, help="Output optimized PDF file (for single file input)"
+        "output",
+        type=str,
+        nargs='?',
+        help="Output optimized PDF file (for single file input)",
     )
     parser.add_argument(
-        "--output_dir", type=str, default="optimized-pdfs", help="Output directory for optimized PDFs (for directory input)"
+        "--output_dir",
+        type=str,
+        default="optimized-pdfs",
+        help="Output directory for optimized PDFs (for directory input)",
     )
     parser.add_argument(
         "--threads",
