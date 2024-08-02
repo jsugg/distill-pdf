@@ -65,13 +65,14 @@ from multiprocessing.synchronize import Semaphore
 import os
 import sys
 import traceback
+import warnings
 import io
 import subprocess
 import argparse
 import tempfile
 import logging
 import shutil
-from typing import Any, List, Tuple, Set, Optional, Union, Callable
+from typing import Any, Dict, List, Tuple, Set, Optional, Union, Callable
 import math
 import random
 import concurrent.futures
@@ -82,6 +83,7 @@ import concurrent.futures
 import difflib
 import time
 import resource
+from pikepdf._core import _ObjectMapping
 import psutil
 
 import numpy as np
@@ -89,6 +91,7 @@ import cv2
 from cv2.typing import MatLike
 from scipy.stats import norm
 from scipy.optimize import minimize, OptimizeResult
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, Sum, WhiteKernel
 from skimage.metrics import structural_similarity as ssim
@@ -106,6 +109,8 @@ MAX_FD_USAGE_PERCENT = 80  # maximum percentage of file descriptors to use
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
+
+warnings.simplefilter("ignore", ConvergenceWarning)
 
 
 class PDFProcessingError(Exception):
@@ -168,11 +173,15 @@ class ContentOptimizationError(PDFProcessingError):
     """Exception raised for errors during content stream optimization."""
 
 
+## File Management
+
 class AdaptiveSemaphore:
     def __init__(self, initial_value: int, max_value: int) -> None:
         self.semaphore: Semaphore = multiprocessing.Semaphore(initial_value)
         self.max_value: int = max_value
-        self.current_value: Synchronized[Any] = multiprocessing.Value('i', initial_value)
+        self.current_value: Synchronized[Any] = multiprocessing.Value(
+            "i", initial_value
+        )
 
     def acquire(self) -> None:
         self.semaphore.acquire()
@@ -195,6 +204,7 @@ class AdaptiveSemaphore:
             with self.current_value.get_lock():
                 self.current_value.value += 1
 
+
 def with_adaptive_semaphore(func):
     @wraps(func)
     def wrapper(*args, **kwargs) -> Any:
@@ -203,16 +213,21 @@ def with_adaptive_semaphore(func):
             return func(*args, **kwargs)
         finally:
             file_semaphore.release()
+
     return wrapper
+
 
 def get_open_files_count() -> int:
     return len(psutil.Process().open_files())
+
 
 def update_semaphore_value() -> None:
     current_open_files: int = get_open_files_count()
     _, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
     available_fds: int = hard_limit - current_open_files
-    max_concurrent: int = min(int(available_fds * MAX_FD_USAGE_PERCENT / 100), cli_args.max_files)
+    max_concurrent: int = min(
+        int(available_fds * MAX_FD_USAGE_PERCENT / 100), cli_args.max_files
+    )
     file_semaphore.update_max_value(max_concurrent)
     logging.info("Updated max concurrent files to: %d", max_concurrent)
 
@@ -245,62 +260,7 @@ def create_temp_file(suffix: str) -> tempfile._TemporaryFileWrapper:
     return tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
 
 
-def get_text_from_image(image: np.ndarray) -> str:
-    """
-    Extract text from an image using OCR.
-
-    Args:
-        image (np.ndarray): The input image.
-
-    Returns:
-        str: The extracted text.
-
-    Raises:
-        ImageProcessingError: If text extraction fails.
-    """
-    try:
-        # pylint: disable=no=member
-        return pytesseract.image_to_string(
-            Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-        )
-        # pylint: enable=no=member
-    except Exception as e:
-        raise ImageProcessingError(
-            "Failed to extract text from image", str(e)
-        ) from e
-
-
-def is_ocr_readable(
-    original_text: str,
-    compressed_image: np.ndarray,
-    similarity_threshold: float = 0.8,
-) -> bool:
-    """
-    Check if the OCR text extracted from a compressed image is readable
-    compared to the original text.
-
-    Args:
-        original_text (str): The original text.
-        compressed_image (np.ndarray): The compressed image.
-        similarity_threshold (float, optional): The similarity threshold.
-                                                Defaults to 0.8.
-
-    Returns:
-        bool: True if the compressed image is OCR readable, False otherwise.
-
-    Raises:
-        ImageProcessingError: If OCR readability check fails.
-    """
-    try:
-        compressed_text: str = get_text_from_image(compressed_image)
-        similarity: float = difflib.SequenceMatcher(
-            None, original_text, compressed_text
-        ).ratio()
-        return similarity >= similarity_threshold
-    except ImageProcessingError as e:
-        raise ImageProcessingError(
-            "Failed to check OCR readability", str(e)
-        ) from e
+## Image Optimization
 
 
 def optimize_raster_image(
@@ -324,7 +284,7 @@ def optimize_raster_image(
     try:
         # pylint: disable=no-member
         nparr: np.ndarray = np.frombuffer(image_bytes, np.uint8)
-        img: MatLike = cv2.imdecode(nparr, cv2.IMREAD_UNCHANGED)  
+        img: MatLike = cv2.imdecode(nparr, cv2.IMREAD_UNCHANGED)
         h, w = img.shape[:2]
         if w > max_width:
             ratio: float = max_width / w
@@ -382,38 +342,6 @@ def is_rect_finite(rect: fitz.Rect) -> bool:
     return all(
         math.isfinite(coord) for coord in [rect.x0, rect.y0, rect.x1, rect.y1]
     )
-
-
-def get_dpi(image_path: str, default_dpi: int = 300) -> int:
-    """
-    Attempt to determine the DPI from the image metadata or
-    return a default.
-
-    Args:
-        image_path (str): The path to the image file.
-        default_dpi (int, optional): The default DPI to useif metadata
-                                     is not available. Defaults to 300.
-
-    Returns:
-        int: The determined DPI.
-
-    Raises:
-        ImageProcessingError: If DPI determination fails.
-    """
-    try:
-        with Image.open(image_path) as img:
-            dpi: Any = img.info.get("dpi", (default_dpi, default_dpi))
-            logging.debug("get_dpi -> DPI: %s", dpi)
-            return (
-                int((dpi[0] + dpi[1]) // 2)
-                if isinstance(dpi, tuple)
-                else default_dpi
-            )
-    except Exception as e:
-        logging.error("Error determining DPI: %s", e)
-        raise ImageProcessingError(
-            "Failed to determine DPI.", f"Error in get_dpi function: {str(e)}"
-        ) from e
 
 
 def get_image_rect(page: fitz.Page, img_xref: int) -> Optional[fitz.Rect]:
@@ -710,47 +638,27 @@ def process_images(
         ) from e
 
 
-def get_text_from_page(page: fitz.Page) -> str:
-    """
-    Extract text content from a PDF page.
-
-    Args:
-        page (fitz.Page): The PDF page.
-
-    Returns:
-        str: The extracted text.
-
-    Raises:
-        PDFProcessingError: If text extraction fails.
-    """
-    try:
-        return page.get_text()  # type: ignore  # pymupdf library does not expose this method
-    except Exception as e:
-        raise PDFProcessingError(
-            f"Failed to extract text from page: {str(e)}", ""
-        ) from e
+## Vector Path Simplification
 
 
 def simplify_vector_path(
-    points: List[Tuple[float, float]], epsilon: float
+    points: List[Tuple[float, float]],
+    epsilon: float,
+    aggressiveness: float = 1.0,
 ) -> List[Tuple[float, float]]:
     """
-    Simplify a vector path by reducing the number of points based
-    on the given epsilon value.
+    Aggressively simplify a vector path by reducing the number of points.
 
     Args:
         points (List[Tuple[float, float]]): The original path points.
         epsilon (float): The simplification threshold.
+        aggressiveness (float): Factor to increase simplification aggressiveness.
 
     Returns:
         List[Tuple[float, float]]: The simplified path points.
     """
 
-    def point_line_distance(
-        point: Tuple[float, float],
-        start: Tuple[float, float],
-        end: Tuple[float, float],
-    ) -> float:
+    def point_line_distance(point, start, end) -> float:
         if start == end:
             return math.hypot(point[0] - start[0], point[1] - start[1])
         n: float = abs(
@@ -763,30 +671,77 @@ def simplify_vector_path(
     if len(points) < 3:
         return points
 
-    dmax: float = 0.0
-    index: int = 0
+    simplified: List[Tuple[float, float]] = [points[0]]
     for i in range(1, len(points) - 1):
-        d: float = point_line_distance(points[i], points[0], points[-1])
-        if d > dmax:
-            index = i
-            dmax = d
+        if (
+            point_line_distance(points[i], simplified[-1], points[-1])
+            > epsilon
+        ):
+            simplified.append(points[i])
+    simplified.append(points[-1])
 
-    if dmax > epsilon:
-        results1: List[Tuple[float, float]] = simplify_vector_path(
-            points[: index + 1], epsilon
-        )
-        results2: List[Tuple[float, float]] = simplify_vector_path(
-            points[index:], epsilon
-        )
-        results: List[Tuple[float, float]] = results1[:-1] + results2
-    else:
-        results = [points[0], points[-1]]
+    return simplified
 
-    return results
+
+def extreme_simplify_vector_path(
+    points: List[Tuple[float, float]],
+    epsilon: float,
+    aggressiveness: float = 1.0,
+) -> List[Tuple[float, float]]:
+    """
+    Extremely aggressively simplify a vector path by drastically reducing the number of points.
+
+    Args:
+        points (List[Tuple[float, float]]): The original path points.
+        epsilon (float): The simplification threshold.
+        aggressiveness (float): Factor to increase simplification aggressiveness.
+
+    Returns:
+        List[Tuple[float, float]]: The extremely simplified path points.
+    """
+    if len(points) < 3:
+        return points
+
+    effective_epsilon: float = epsilon * (aggressiveness**2)
+
+    def point_line_distance(point, start, end) -> float:
+        if start == end:
+            return math.hypot(point[0] - start[0], point[1] - start[1])
+        n: float = abs(
+            (end[0] - start[0]) * (start[1] - point[1])
+            - (start[0] - point[0]) * (end[1] - start[1])
+        )
+        d: float = math.hypot(end[0] - start[0], end[1] - start[1])
+        return n / d
+
+    simplified: List[Tuple[float, float]] = [points[0]]
+    for i in range(1, len(points) - 1):
+        if (
+            point_line_distance(points[i], simplified[-1], points[-1])
+            > effective_epsilon
+        ):
+            simplified.append(points[i])
+    simplified.append(points[-1])
+
+    # Additional aggressive simplification
+    while len(simplified) > 3 and len(simplified) > len(points) / 5:
+        temp: List[Tuple[float, float]] = [simplified[0]]
+        for i in range(1, len(simplified) - 1, 2):
+            if (
+                point_line_distance(simplified[i], temp[-1], simplified[-1])
+                > effective_epsilon
+            ):
+                temp.append(simplified[i])
+        temp.append(simplified[-1])
+        if len(temp) == len(simplified):
+            break
+        simplified = temp
+
+    return simplified
 
 
 def extreme_vector_optimization(
-    page: fitz.Page, epsilon: float
+    page: fitz.Page, epsilon: float, aggressiveness: float = 1.0
 ) -> Tuple[int, int]:
     """
     Perform extreme vector path optimization on a PDF page.
@@ -794,17 +749,17 @@ def extreme_vector_optimization(
     Args:
         page (fitz.Page): The PDF page to optimize.
         epsilon (float): The simplification threshold.
+        aggressiveness (float): Factor to increase simplification aggressiveness.
 
     Returns:
         Tuple[int, int]: The total number of points before and
                          after optimization.
 
     Raises:
-        VectorOptimizationError: If an error occurs during
-                                 vector optimization.
+        VectorOptimizationError: If an error occurs during vector optimization.
     """
     try:
-        shape: Any = page.new_shape()  # type: ignore  # pymupdf library does not expose this method
+        shape: Any = page.new_shape()  # type: ignore  # fitz methods don't support type checking
         total_points_before: int = 0
         total_points_after: int = 0
         for path in page.get_drawings():
@@ -812,7 +767,7 @@ def extreme_vector_optimization(
                 points: List[Tuple[float, float]] = path["pts"]
                 total_points_before += len(points)
                 simplified_points: List[Tuple[float, float]] = (
-                    simplify_vector_path(points, epsilon)
+                    simplify_vector_path(points, epsilon, aggressiveness)
                 )
                 total_points_after += len(simplified_points)
                 if path["type"] == "l" and len(simplified_points) >= 2:
@@ -834,37 +789,129 @@ def extreme_vector_optimization(
         ) from e
 
 
-def image_similarity(img1: Image.Image, img2: Image.Image) -> float:
+def shape_aware_extreme_optimization(
+    page: fitz.Page, epsilon: float, aggressiveness: float = 1.0
+) -> Tuple[int, int]:
     """
-    Calculate the structural similarity index between two images.
+    Perform shape-aware extreme vector path optimization on a PDF page.
 
     Args:
-        img1 (Image.Image): The first image.
-        img2 (Image.Image): The second image.
+        page (fitz.Page): The PDF page to optimize.
+        epsilon (float): The simplification threshold.
+        aggressiveness (float): Factor to increase simplification aggressiveness.
 
     Returns:
-        float: The structural similarity index.
-
-    Raises:
-        ImageProcessingError: If similarity calculation fails.
+        Tuple[int, int]: The total number of points before and after optimization.
     """
+
+    def is_rectangular(
+        points: List[Tuple[float, float]], tolerance: float = 0.1
+    ) -> bool:
+        if (
+            len(points) != 5
+        ):  # A rectangle should have 5 points (including the repeated first point)
+            return False
+
+        # Check if opposite sides are parallel and equal in length
+        def are_parallel_and_equal(side1, side2, tolerance) -> bool:
+            len1: float = math.hypot(side1[0], side1[1])
+            len2: float = math.hypot(side2[0], side2[1])
+            return abs(
+                side1[0] * side2[1] - side1[1] * side2[0]
+            ) < tolerance and abs(len1 - len2) < tolerance * max(len1, len2)
+
+        side1: Tuple[float, float] = (
+            points[1][0] - points[0][0],
+            points[1][1] - points[0][1],
+        )
+        side2: Tuple[float, float] = (
+            points[2][0] - points[1][0],
+            points[2][1] - points[1][1],
+        )
+        side3: Tuple[float, float] = (
+            points[3][0] - points[2][0],
+            points[3][1] - points[2][1],
+        )
+        side4: Tuple[float, float] = (
+            points[0][0] - points[3][0],
+            points[0][1] - points[3][1],
+        )
+
+        return are_parallel_and_equal(
+            side1, side3, tolerance
+        ) and are_parallel_and_equal(side2, side4, tolerance)
+
+    def is_circular(
+        points: List[Tuple[float, float]], tolerance: float = 0.1
+    ) -> bool:
+        if len(points) < 8:  # Arbitrary minimum number of points for a circle
+            return False
+
+        # Calculate center and average radius
+        cx: float = sum(p[0] for p in points) / len(points)
+        cy: float = sum(p[1] for p in points) / len(points)
+        avg_radius: float = sum(
+            math.hypot(p[0] - cx, p[1] - cy) for p in points
+        ) / len(points)
+
+        # Check if all points are approximately on the circle
+        return all(
+            abs(math.hypot(p[0] - cx, p[1] - cy) - avg_radius)
+            < tolerance * avg_radius
+            for p in points
+        )
+
     try:
-        img1_gray: Image.Image = img1.convert("L")
-        img2_gray: Image.Image = img2.convert("L")
+        shape: Any = page.new_shape()  # type: ignore  # fitz methods don't support type checking
+        total_points_before: int = 0
+        total_points_after: int = 0
 
-        if img1_gray.size != img2_gray.size:
-            img2_gray = img2_gray.resize(img1_gray.size)
+        for path in page.get_drawings():
+            if path["type"] in ["l", "c"]:  # line or curve
+                points: List[Tuple[float, float]] = path["pts"]
+                total_points_before += len(points)
 
-        img1_array: np.ndarray = np.array(img1_gray)
-        img2_array: np.ndarray = np.array(img2_gray)
+                if is_rectangular(points):
+                    # Simplify to exact rectangle
+                    simplified_points = [
+                        points[0],
+                        points[1],
+                        points[2],
+                        points[3],
+                        points[0],
+                    ]
+                elif is_circular(points):
+                    # Simplify to circle/ellipse
+                    rect = fitz.Rect(points[0], points[-1]).normalize()
+                    shape.draw_oval(rect)
+                    simplified_points: List[Tuple[float, float]] = []
+                else:
+                    # Extreme simplification for other shapes
+                    simplified_points: List[Tuple[float, float]] = (
+                        extreme_simplify_vector_path(
+                            points, epsilon, aggressiveness
+                        )
+                    )
 
-        similarity: float
-        _: Any
-        similarity, _ = ssim(img1_array, img2_array, full=True)
-        return similarity
+                total_points_after += len(simplified_points)
+
+                if simplified_points:
+                    if path["type"] == "l":
+                        shape.draw_polyline(simplified_points)
+                    elif path["type"] == "c" and len(simplified_points) >= 4:
+                        shape.draw_bezier(simplified_points)
+            elif path["type"] in ["f", "s"]:  # fill or stroke
+                shape.finish(fill=path["type"] == "f", color=path.get("color"))
+            elif path["type"] == "e":  # ellipse
+                rect: fitz.Rect = fitz.Rect(path["rect"])
+                shape.draw_oval(rect)
+
+        shape.commit()
+        return total_points_before, total_points_after
     except Exception as e:
-        raise ImageProcessingError(
-            f"Failed to calculate image similarity: {str(e)}", ""
+        raise VectorOptimizationError(
+            f"Error during shape-aware extreme vector optimization: {str(e)}",
+            traceback.format_exc(),
         ) from e
 
 
@@ -883,19 +930,17 @@ def calculate_ei(
     Returns:
         np.ndarray: The expected improvement values.
     """
-    imp: np.ndarray = mu - mu_sample_opt - xi
-    z: np.ndarray = np.divide(
-        imp, sigma, out=np.zeros_like(sigma), where=sigma != 0
-    )
-    result: np.ndarray = imp * norm.cdf(z) + sigma * norm.pdf(z)
-    result[sigma == 0.0] = 0.0
-    return result
+    imp = mu - mu_sample_opt - xi
+    z = np.divide(imp, sigma, out=np.zeros_like(sigma), where=sigma != 0)
+    ei = imp * norm.cdf(z) + sigma * norm.pdf(z)
+    ei[sigma == 0.0] = 0.0
+    return ei
 
 
 def expected_improvement(
     x: np.ndarray,
     x_sample: np.ndarray,
-    _y_sample: np.ndarray,
+    y_sample: np.ndarray,
     gpr: GaussianProcessRegressor,
     xi: float = 0.01,
 ) -> np.ndarray:
@@ -905,7 +950,7 @@ def expected_improvement(
     Args:
         x (np.ndarray): The input points.
         x_sample (np.ndarray): The sample points.
-        _y_sample (np.ndarray): The sample values (unused).
+        y_sample (np.ndarray): The sample values.
         gpr (GaussianProcessRegressor): The Gaussian Process Regressor.
         xi (float, optional): Exploration-exploitation trade-off parameter.
                               Defaults to 0.01.
@@ -913,16 +958,18 @@ def expected_improvement(
     Returns:
         np.ndarray: The expected improvement values.
     """
-    mu: Union[Any, np.ndarray]
-    sigma: Union[Any, np.ndarray]
-    mu, sigma = gpr.predict(x.reshape(-1, 1), return_std=True)  # type: ignore  # given the current arguments, this is safe
-    mu_sample: Union[np.ndarray, Tuple[np.ndarray]] = gpr.predict(x_sample)  # type: ignore  # given the current arguments, this is safe
+    mu, sigma = gpr.predict(x.reshape(-1, 2), return_std=True)  # type: ignore
+    mu_sample = gpr.predict(x_sample)
 
     sigma = sigma.reshape(-1, 1)
-    mu_sample_opt: float = np.max(mu_sample)
+    mu_sample_opt = np.max(mu_sample)
 
     with np.errstate(divide="warn"):
-        ei: np.ndarray = calculate_ei(mu, mu_sample_opt, xi, sigma)
+        imp = mu - mu_sample_opt - xi
+        z = np.divide(imp, sigma, out=np.zeros_like(sigma), where=sigma != 0)
+        ei = imp * norm.cdf(z) + sigma * norm.pdf(z)
+        ei[sigma == 0.0] = 0.0
+
     return ei.ravel()
 
 
@@ -957,22 +1004,19 @@ def propose_location(
         return -acquisition(x.reshape(1, -1), x_sample, y_sample, gpr).ravel()
 
     for x0 in np.random.uniform(
-        bounds[:, 0], bounds[:, 1], size=(n_restarts, 1)
+        bounds[:, 0], bounds[:, 1], size=(n_restarts, 2)
     ):
-        res: OptimizeResult = minimize(
-            min_obj, x0=x0, bounds=bounds, method="L-BFGS-B"
-        )
+        res = minimize(min_obj, x0=x0, bounds=bounds, method="L-BFGS-B")
         if res.fun < min_val:
             min_val = (
                 res.fun[0] if isinstance(res.fun, np.ndarray) else res.fun
             )
             min_x = res.x
-
     return min_x
 
 
 def bayesian_optimization(
-    objective: Callable[[float], float],
+    objective: Callable[[np.ndarray], float],
     bounds: np.ndarray,
     n_iterations: int,
     n_initial: int = 5,
@@ -982,24 +1026,24 @@ def bayesian_optimization(
     objective function.
 
     Args:
-        objective (Callable[[float], float]): The objective function to optimize.
+        objective (Callable[[np.ndarray], float]): The objective function to optimize.
         bounds (np.ndarray): The bounds for optimization.
         n_iterations (int): The number of optimization iterations.
         n_initial (int, optional): The number of initial random samples.
                                    Defaults to 5.
 
     Returns:
-        Tuple[float, float]: The best input value and its corresponding
-                             objective value.
+        Tuple[float, float]: The best input values (epsilon, aggressiveness)
+                             for vector simplification.
     """
     dim: int = bounds.shape[0]
     x_sample: np.ndarray = np.random.uniform(
         bounds[:, 0], bounds[:, 1], size=(n_initial, dim)
     )
-    y_sample: np.ndarray = np.array([objective(x[0]) for x in x_sample])
+    y_sample: np.ndarray = np.array([objective(x) for x in x_sample])
 
     kernel: Sum = Matern(
-        nu=2.5, length_scale=1.0, length_scale_bounds=(1e-2, 1e5)
+        nu=2.5, length_scale=[1.0] * dim, length_scale_bounds=(1e-2, 1e5)
     ) + WhiteKernel(noise_level=1e-5, noise_level_bounds=(1e-12, 1e2))
     gpr: GaussianProcessRegressor = GaussianProcessRegressor(
         kernel=kernel, n_restarts_optimizer=25, random_state=42
@@ -1020,13 +1064,13 @@ def bayesian_optimization(
             )
             break
 
-        next_sample = next_sample.ravel()
-        next_objective: float = objective(next_sample[0])
-        logging.info(
-            "Iteration %d/%d: epsilon = %.4f, similarity = %.4f",
+        next_objective: float = objective(next_sample)
+        logging.debug(
+            "Iteration %d/%d: epsilon = %.4f, aggressiveness = %.4f, objective = %.4f",
             i + 1,
             n_iterations,
             next_sample[0],
+            next_sample[1],
             next_objective,
         )
 
@@ -1034,39 +1078,110 @@ def bayesian_optimization(
         y_sample = np.append(y_sample, next_objective)
 
     best_idx: int = int(np.argmax(y_sample))
-    return float(x_sample[best_idx, 0]), float(y_sample[best_idx])
+    best_params: np.ndarray = x_sample[best_idx]
+
+    return float(best_params[0]), float(best_params[1])
+
+
+def text_aware_vector_optimization(
+    page: fitz.Page, epsilon: float, aggressiveness: float = 1.0
+) -> Tuple[int, int]:
+    """
+    Perform text-aware vector path optimization on a PDF page.
+
+    Args:
+        page (fitz.Page): The PDF page to optimize.
+        epsilon (float): The simplification threshold.
+        aggressiveness (float): Factor to increase simplification aggressiveness.
+
+    Returns:
+        Tuple[int, int]: The total number of points before and after optimization.
+    """
+    try:
+
+        def simplify_path(points, epsilon, is_text_area):
+            if len(points) < 3:
+                return points
+
+            if is_text_area:
+                # Use less aggressive simplification for text areas
+                return simplify_vector_path(points, epsilon)
+            else:
+                # Use more aggressive simplification for non-text areas
+                return extreme_simplify_vector_path(
+                    points, epsilon, aggressiveness
+                )
+
+        shape = page.new_shape()  # type: ignore  # fitz methods don't support type checking
+        total_points_before = 0
+        total_points_after = 0
+
+        # Get text areas
+        text_areas = [word[:4] for word in page.get_text("words")]  # type: ignore  # fitz methods don't support type checking
+
+        for path in page.get_drawings():
+            if path["type"] in ["l", "c"]:  # line or curve
+                points = path["pts"]
+                total_points_before += len(points)
+
+                # Check if path intersects with any text area
+                path_rect = fitz.Rect(points[0], points[-1]).normalize()
+                intersects_text = any(
+                    path_rect.intersects(fitz.Rect(area))
+                    for area in text_areas
+                )
+
+                simplified_points = simplify_path(
+                    points, epsilon, intersects_text
+                )
+                total_points_after += len(simplified_points)
+
+                if path["type"] == "l" and len(simplified_points) >= 2:
+                    shape.draw_polyline(simplified_points)
+                elif path["type"] == "c" and len(simplified_points) >= 4:
+                    shape.draw_bezier(simplified_points)
+            elif path["type"] in ["f", "s"]:  # fill or stroke
+                shape.finish(fill=path["type"] == "f", color=path.get("color"))
+            elif path["type"] == "e":  # ellipse
+                rect = fitz.Rect(path["rect"])
+                shape.draw_oval(rect)
+
+        shape.commit()
+        return total_points_before, total_points_after
+    except Exception as e:
+        raise VectorOptimizationError(
+            f"Error during text-aware vector optimization: {str(e)}",
+            traceback.format_exc(),
+        ) from e
 
 
 def find_optimal_vector_simplification(
     doc: fitz.Document,
-    min_epsilon: float = 0.1,
+    min_epsilon: float = 0.01,
     max_epsilon: float = 10.0,
-    n_iterations: int = 20,
+    min_aggressiveness: float = 1.0,
+    max_aggressiveness: float = 10.0,
+    n_iterations: int = 40,
     sample_size: int = 5,
-    similarity_threshold: float = 0.8,
-) -> float:
+    similarity_threshold: float = 0.5,
+) -> Tuple[float, float]:
     """
-    Find the optimal vector simplification epsilon value for a
-    PDF document using Bayesian optimization.
+    Find the optimal vector simplification epsilon value and aggressiveness
+    factor for extreme simplification using Bayesian optimization.
 
     Args:
         doc (fitz.Document): The PDF document.
-        min_epsilon (float, optional): The minimum epsilon value.
-                                       Defaults to 0.1.
-        max_epsilon (float, optional): The maximum epsilon value.
-                                       Defaults to 10.0.
-        n_iterations (int, optional): The number of optimization iterations.
-                                      Defaults to 20.
-        sample_size (int, optional): The number of pages to sample.
-                                     Defaults to 5.
-        similarity_threshold (float, optional): The similarity threshold.
-                                                Defaults to 0.8.
+        min_epsilon (float): The minimum epsilon value.
+        max_epsilon (float): The maximum epsilon value.
+        min_aggressiveness (float): The minimum aggressiveness factor.
+        max_aggressiveness (float): The maximum aggressiveness factor.
+        n_iterations (int): The number of optimization iterations.
+        sample_size (int): The number of pages to sample.
+        similarity_threshold (float): The similarity threshold.
 
     Returns:
-        float: The optimal epsilon value for vector simplification.
-
-    Raises:
-        VectorOptimizationError: If an error occurs during optimization.
+        Tuple[float, float]: The optimal epsilon value and aggressiveness factor
+                             for vector simplification.
     """
     try:
         num_pages: int = len(doc)
@@ -1074,72 +1189,63 @@ def find_optimal_vector_simplification(
             random.sample(range(num_pages), min(sample_size, num_pages))
         )
 
-        initial_similarity: float
-        _: Any
-        _, initial_similarity = optimize_and_compare(
-            doc, min_epsilon, sample_pages
-        )
-        if initial_similarity == 1.0:
-            logging.info(
-                "No vector content to optimize. Skipping vector simplification."
+        def objective(params: np.ndarray) -> float:
+            epsilon, aggressiveness = params
+            total_points_before: int = 0
+            total_points_after: int = 0
+
+            for page_num in sample_pages:
+                page = doc[page_num]
+                points_before, points_after = shape_aware_extreme_optimization(
+                    page, epsilon, aggressiveness
+                )
+                total_points_before += points_before
+                total_points_after += points_after
+
+            similarity: float = (
+                total_points_after / total_points_before
+                if total_points_before > 0
+                else 1.0
             )
-            return min_epsilon
-    except Exception as e:
-        raise VectorOptimizationError(
-            "Error in find_optimal_vector_simplification",
-            traceback.format_exc(),
-        ) from e
-
-    def objective(epsilon: float) -> float:
-        """
-        Calculate the objective function value based on the similarity ratio
-        obtained from optimizing and comparing a PDF document.
-
-        Args:
-            epsilon (float): The epsilon value for vector simplification.
-
-        Returns:
-            float: The similarity ratio.
-        """
-        try:
-            similarity: float
-            _: Any
-            _, similarity = optimize_and_compare(doc, epsilon, sample_pages)
-            logging.info(
-                "Objective evaluation: epsilon = %.4f, similarity = %.4f",
-                epsilon,
-                similarity,
+            simplification_score: float = (
+                1 - similarity
+            ) ** 2  # Squared to favor more extreme simplification
+            readability_penalty: float = (
+                max(0, similarity_threshold - similarity) * 2
             )
-            return similarity
-        except Exception as e:  # pylint: disable=broad-except
-            logging.error("Error in objective function: %s", str(e))
-            return 0.0
 
-    logging.info("Starting Bayesian optimization for vector simplification")
+            return simplification_score - readability_penalty
 
-    try:
-        bounds: np.ndarray = np.array([[min_epsilon, max_epsilon]])
-        best_epsilon: float
-        best_similarity: float
-        best_epsilon, best_similarity = bayesian_optimization(
-            objective, bounds, n_iterations
+        bounds: np.ndarray = np.array(
+            [
+                [min_epsilon, max_epsilon],
+                [min_aggressiveness, max_aggressiveness],
+            ]
         )
+        result: OptimizeResult = minimize(
+            lambda x: -objective(x),
+            x0=np.array(
+                [
+                    (min_epsilon + max_epsilon) / 2,
+                    (min_aggressiveness + max_aggressiveness) / 2,
+                ]
+            ),
+            bounds=bounds,
+            method="L-BFGS-B",
+            options={"maxiter": n_iterations},
+        )
+
+        best_epsilon, best_aggressiveness = result.x
+        best_score: float = -result.fun
 
         logging.info(
-            "Optimization complete. Best epsilon: %.4f, Best similarity: %.4f",
+            "Extreme optimization complete. Best epsilon: %.4f, Best aggressiveness: %.4f, Best score: %.4f",
             best_epsilon,
-            best_similarity,
+            best_aggressiveness,
+            best_score,
         )
 
-        if best_similarity < similarity_threshold:
-            logging.warning(
-                "Best similarity (%.4f) is below the threshold (%.4f)."
-                "Results may not be optimal.",
-                best_similarity,
-                similarity_threshold,
-            )
-
-        return float(best_epsilon)
+        return float(best_epsilon), float(best_aggressiveness)
     except Exception as e:
         raise VectorOptimizationError(
             "Error in find_optimal_vector_simplification",
@@ -1147,54 +1253,7 @@ def find_optimal_vector_simplification(
         ) from e
 
 
-def optimize_and_compare(
-    doc: fitz.Document, epsilon: float, sample_pages: List[int]
-) -> Tuple[float, float]:
-    """
-    Optimize vector paths on selected pages of a PDF document and compare
-    the optimization results.
-
-    Args:
-        doc (fitz.Document): The PDF document.
-        epsilon (float): The epsilon value for vector simplification.
-        sample_pages (List[int]): The list of page numbers to sample.
-
-    Returns:
-        Tuple[float, float]: The epsilon value and the similarity ratio.
-
-    Raises:
-        VectorOptimizationError: If an error occurs during optimization
-                                 or comparison.
-    """
-    try:
-        temp_doc: fitz.Document = fitz.open()
-        temp_doc.insert_pdf(
-            doc, from_page=min(sample_pages), to_page=max(sample_pages)
-        )
-
-        total_points_before: int = 0
-        total_points_after: int = 0
-
-        for page in temp_doc:
-            points_before: int
-            points_after: int
-            points_before, points_after = extreme_vector_optimization(
-                page, epsilon
-            )
-            total_points_before += points_before
-            total_points_after += points_after
-
-        similarity: float = (
-            1.0
-            if total_points_before == 0
-            else total_points_after / total_points_before
-        )
-
-        return epsilon, similarity
-    except Exception as e:
-        raise VectorOptimizationError(
-            "Error in optimize_and_compare", traceback.format_exc()
-        ) from e
+## Fonts optimization
 
 
 def get_used_characters(doc: fitz.Document) -> Set[str]:
@@ -1271,6 +1330,9 @@ def aggressive_font_subset(pdf: pikepdf.Pdf, used_chars: Set[str]) -> None:
                                     ) from e
 
 
+## Metadata optimization
+
+
 def remove_metadata(pdf: pikepdf.Pdf) -> None:
     """
     Remove metadata from a PDF object.
@@ -1284,47 +1346,45 @@ def remove_metadata(pdf: pikepdf.Pdf) -> None:
         del pdf.Root["/Metadata"]
 
 
-def clean_pdf(pdf: pikepdf.Pdf) -> None:
+## Objects optimization
+
+
+def clean_page_resources(page, pdf) -> None:
     """
-    Clean up a PDF object by removing unreferenced resources
-    and indirect objects from pages.
+    Removes duplicated and unnecessary indirect objects from page resources.
 
     Args:
-        pdf (pikepdf.Pdf): The PDF object.
-
-    Raises:
-        PDFProcessingError: If PDF cleaning fails.
+        page (pikepdf.Object): A page in the PDF.
+        seen_objects (dict): A dictionary to track already seen objects.
     """
-    try:
-        pdf.remove_unreferenced_resources()
-        for page in pdf.pages:
-            if "/Resources" in page:
-                resources: pikepdf.Object = page["/Resources"]
-                for resource_type in [
-                    "/XObject",
-                    "/ExtGState",
-                    "/Pattern",
-                    "/Shading",
-                ]:
-                    if resource_type in resources:
-                        resource_dict: pikepdf.Object = resources[
-                            resource_type
-                        ]
-                        keys_to_delete: List[str] = []
-                        for key, value in resource_dict.items():
-                            if value.is_indirect:
-                                try:
-                                    _: pikepdf.Object = pdf.get_object(
-                                        value.objgen
-                                    )
-                                except KeyError:
-                                    keys_to_delete.append(key)
-                        for key in keys_to_delete:
-                            del resource_dict[key]
-    except Exception as e:
-        raise PDFProcessingError(
-            "Failed to clean PDF", traceback.format_exc()
-        ) from e
+    if "/Resources" not in page:
+        return
+    resources = page["/Resources"]
+    for resource_type in ["/XObject", "/ExtGState", "/Pattern", "/Shading"]:
+        if resource_type in resources:
+            resource_dict = resources[resource_type]
+            seen_objects = {}
+            keys_to_delete = []
+
+            for key, value in resource_dict.items():
+                if value.is_indirect:
+                    object_id = value.objgen[0]
+                    if object_id in seen_objects:
+                        # Replace duplicate with a reference to the first seen
+                        resources[resource_type][key] = seen_objects[object_id]
+                        continue
+                    seen_objects[object_id] = value
+                    # Check if the object is necessary
+                    try:
+                        _ = pdf.get_object(value.objgen)
+                    except KeyError:
+                        keys_to_delete.append(key)
+
+            for key in keys_to_delete:
+                del resource_dict[key]
+
+
+## Annotations optimization
 
 
 def flatten_annotations(doc: fitz.Document) -> None:
@@ -1365,6 +1425,9 @@ def flatten_annotations(doc: fitz.Document) -> None:
         raise PDFProcessingError(
             "Failed to flatten annotations", traceback.format_exc()
         ) from e
+
+
+## Content stream optimization
 
 
 @lru_cache(maxsize=1000)
@@ -1448,30 +1511,54 @@ def optimize_pdf_contents(pdf: pikepdf.Pdf) -> None:
                     ) from e
 
 
-def process_single_pdf(args: Tuple[str, str, int, bool, bool]) -> Tuple[str, int, int, float]:
+# PDF Processing
+
+
+def process_single_pdf(
+    args: Tuple[str, str, int, bool, bool]
+) -> Tuple[str, int, int, float]:
     """
     Process a single PDF file with retry mechanism and adaptive concurrency.
 
     Args:
-        args (Tuple[str, str, int, bool, bool]): Input file, output file, num_threads, grayscale, flatten.
+        args (Tuple[str, str, int, bool, bool]): Input file, output file, num_threads,
+                                                 grayscale, flatten.
 
     Returns:
-        Tuple[str, int, int, float]: File name, original size, optimized size, and reduction percentage.
+        Tuple[str, int, int, float]: File name, original size, optimized size,
+                                     and reduction percentage.
     """
     input_file, output_file, num_threads, grayscale, flatten = args
     for attempt in range(MAX_RETRIES):
         try:
             update_semaphore_value()  # Update semaphore before processing
-            original_size, optimized_size, reduction_percentage = extreme_pdf_optimization(
-                input_file, output_file, num_threads, grayscale, flatten
+            original_size, optimized_size, reduction_percentage = (
+                extreme_pdf_optimization(
+                    input_file, output_file, num_threads, grayscale, flatten
+                )
             )
-            return os.path.basename(input_file), original_size, optimized_size, reduction_percentage
+            return (
+                os.path.basename(input_file),
+                original_size,
+                optimized_size,
+                reduction_percentage,
+            )
         except OSError as e:
             if attempt < MAX_RETRIES - 1:
-                logging.warning("Attempt %d failed for %s: %s. Retrying...", attempt + 1, input_file, str(e))
+                logging.warning(
+                    "Attempt %d failed for %s: %s. Retrying...",
+                    attempt + 1,
+                    input_file,
+                    str(e),
+                )
                 time.sleep(RETRY_DELAY)
             else:
-                logging.error("Failed to process %s after %d attempts: %s", input_file, MAX_RETRIES, str(e))
+                logging.error(
+                    "Failed to process %s after %d attempts: %s",
+                    input_file,
+                    MAX_RETRIES,
+                    str(e),
+                )
                 return os.path.basename(input_file), 0, 0, 0.0
         except Exception as e:  # pylint: disable=broad-except
             logging.error("Error processing %s: %s", input_file, str(e))
@@ -1485,10 +1572,11 @@ def optimize_directory(
     output_dir: str,
     num_threads: int,
     grayscale: bool,
-    flatten: bool
+    flatten: bool,
 ) -> None:
     """
-    Optimize all PDF files in the given input directory and save them to the output directory.
+    Optimize all PDF files in the given input directory and save them
+    to the output directory.
 
     Args:
         input_dir (str): The path to the input directory containing PDF files.
@@ -1507,7 +1595,9 @@ def optimize_directory(
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    pdf_files: List[str] = [f for f in os.listdir(input_dir) if f.lower().endswith('.pdf')]
+    pdf_files: List[str] = [
+        f for f in os.listdir(input_dir) if f.lower().endswith(".pdf")
+    ]
     total_files: int = len(pdf_files)
 
     logging.info("Found %d PDF files to process.", total_files)
@@ -1517,19 +1607,29 @@ def optimize_directory(
         (
             os.path.join(input_dir, pdf_file),
             os.path.join(output_dir, f"optimized_{pdf_file}"),
-            max(1, num_threads // total_files),  # Distribute threads among files
+            max(
+                1, num_threads // total_files
+            ),  # Distribute threads among files
             grayscale,
-            flatten
+            flatten,
         )
         for pdf_file in pdf_files
     ]
 
     # Use ThreadPoolExecutor for parallel processing
-    with concurrent.futures.ThreadPoolExecutor(max_workers=file_semaphore.max_value) as executor:
-        futures: List[concurrent.futures.Future[Tuple[str, int, int, float]]] = [executor.submit(process_single_pdf, args) for args in process_args]
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=file_semaphore.max_value
+    ) as executor:
+        futures: List[
+            concurrent.futures.Future[Tuple[str, int, int, float]]
+        ] = [
+            executor.submit(process_single_pdf, args) for args in process_args
+        ]
 
         for future in concurrent.futures.as_completed(futures):
-            file_name, original_size, optimized_size, reduction_percentage = future.result()
+            file_name, original_size, optimized_size, reduction_percentage = (
+                future.result()
+            )
             if original_size > 0:
                 logging.info("Processed: %s", file_name)
                 logging.info("Original size: %d bytes", original_size)
@@ -1539,8 +1639,13 @@ def optimize_directory(
                 logging.error("Failed to process: %s", file_name)
 
             # Log current semaphore value and open files count
-            logging.info("Current semaphore value: %d", file_semaphore.get_current_value())
-            logging.info("Current open files count: %d", get_open_files_count())
+            logging.info(
+                "Current semaphore value: %d",
+                file_semaphore.get_current_value(),
+            )
+            logging.info(
+                "Current open files count: %d", get_open_files_count()
+            )
 
 
 @with_adaptive_semaphore
@@ -1550,6 +1655,7 @@ def extreme_pdf_optimization(
     num_threads: int,
     grayscale: bool,
     flatten: bool,
+    aggressive_mode: bool = True,
 ) -> Tuple[int, int, float]:
     """
     Perform extreme optimization on a PDF file.
@@ -1584,21 +1690,90 @@ def extreme_pdf_optimization(
         pdf: pikepdf.Pdf = pikepdf.open(temp_pdf_path)
         doc: fitz.Document = fitz.open(temp_pdf_path)
 
+        logging.info("Removing unreferenced resources...")
+        pdf.remove_unreferenced_resources()
+
+        # Clean PDF and remove hidden objects
+        logging.info("Cleaning duplicated and unnecessary indirect objects...")
+        for page_num in range(len(doc)):
+            page: fitz.Page = doc[page_num]
+            try:
+                # remove_hidden_objects(page, pdf)
+                if "/Resources" in pdf.pages[page_num]:
+                    clean_page_resources(pdf.pages[page_num], pdf)
+            except Exception as e:
+                logging.warning(f"Error processing page {page_num}: {str(e)}")
+
+        # Define the objective function for Bayesian optimization
+        def optimization_objective(params) -> float:
+            epsilon, aggressiveness = params
+            total_reduction = 0
+            total_quality_loss = 0
+
+            for page in doc:
+                original_size: int = len(page.get_contents())
+                if aggressive_mode:
+                    _, points_after = text_aware_vector_optimization(
+                        page, epsilon, aggressiveness
+                    )
+                else:
+                    _, points_after = shape_aware_extreme_optimization(
+                        page, epsilon, aggressiveness
+                    )
+                optimized_size: int = len(page.get_contents())
+
+                size_reduction: float = (
+                    original_size - optimized_size
+                ) / original_size
+                total_reduction += size_reduction
+
+                # Calculate quality loss (this is a simplified measure and might need refinement)
+                quality_loss: float = 1 - (points_after / original_size)
+                total_quality_loss += quality_loss
+
+            avg_reduction: float = total_reduction / len(doc)
+            avg_quality_loss: float = total_quality_loss / len(doc)
+
+            # Balance between size reduction and quality preservation
+            return avg_reduction - (0.5 * avg_quality_loss)
+
+        # Perform Bayesian optimization
+        logging.info("Finding optimal parameters for vector simplification...")
+        bounds: np.ndarray[Any, np.dtype[Any]] = np.array(
+            [[0.01, 10.0], [1.0, 10.0]]
+        )  # for epsilon and aggressiveness
+        optimal_params: Tuple[float, float] = bayesian_optimization(
+            optimization_objective, bounds, n_iterations=20
+        )
+        optimal_epsilon, optimal_aggressiveness = optimal_params
+
+        logging.info(
+            "Optimal parameters: epsilon=%.4f, aggressiveness=%.4f",
+            optimal_epsilon,
+            optimal_aggressiveness,
+        )
+
+        # Apply vector optimizations
+        logging.info("Applying vector optimizations...")
+        for page in doc:
+            if aggressive_mode:
+                text_aware_vector_optimization(
+                    page, optimal_epsilon, optimal_aggressiveness
+                )
+            else:
+                shape_aware_extreme_optimization(
+                    page, optimal_epsilon, optimal_aggressiveness
+                )
+
         logging.info("Collecting used characters...")
         used_chars: Set[str] = get_used_characters(doc)
+        doc.close()
 
         logging.info("Aggressively subsetting fonts...")
         aggressive_font_subset(pdf, used_chars)
 
         logging.info("Removing metadata...")
         remove_metadata(pdf)
-
-        logging.info("Cleaning PDF...")
-        clean_pdf(pdf)
-
-        if flatten:
-            logging.info("Flattening annotations...")
-            flatten_annotations(doc)
 
         logging.info("Optimizing content streams...")
         optimize_pdf_contents(pdf)
@@ -1609,19 +1784,31 @@ def extreme_pdf_optimization(
         pdf.save(temp_pdf_path2)
         pdf.close()
 
-        doc = fitz.open(temp_pdf_path2)
+        doc: fitz.Document = fitz.open(temp_pdf_path2)
 
-        logging.info("Finding optimal vector simplification epsilon...")
-        optimal_epsilon: float = find_optimal_vector_simplification(doc)
-        if optimal_epsilon > 0.0:
-            logging.info(
-                "Optimal vector simplification epsilon: %f", optimal_epsilon
+        if flatten:
+            logging.info("Flattening annotations...")
+            flatten_annotations(doc)
+
+        logging.info(
+            "Finding optimal extreme vector simplification parameters..."
+        )
+        optimal_epsilon, optimal_aggressiveness = (
+            find_optimal_vector_simplification(doc)
+        )
+
+        logging.info(
+            "Optimal extreme vector simplification epsilon: %f, aggressiveness: %f",
+            optimal_epsilon,
+            optimal_aggressiveness,
+        )
+
+        logging.info("Applying extreme vector optimization...")
+        for page in doc:
+            page.clean_contents(sanitize=True)
+            shape_aware_extreme_optimization(
+                page, optimal_epsilon, optimal_aggressiveness
             )
-
-            logging.info("Extremely optimizing vector paths...")
-            for page in doc:
-                page.clean_contents(sanitize=True)
-                extreme_vector_optimization(page, optimal_epsilon)
 
         logging.info("Aggressively optimizing images...")
         process_images(doc, num_threads=num_threads, grayscale=grayscale)
@@ -1672,7 +1859,7 @@ def extreme_pdf_optimization(
         logging.info(
             "Extreme optimization complete. Final file: %s", output_file
         )
-    except Exception as e:  # pylint: disable=broad-except
+    except Exception as e:
         logging.error("Error optimizing PDF: %s", str(e))
         logging.error(traceback.format_exc())
         raise PDFProcessingError("PDF optimization failed", str(e)) from e
@@ -1685,6 +1872,24 @@ def extreme_pdf_optimization(
     optimized_size = os.path.getsize(output_file)
     reduction_percentage = (1 - optimized_size / original_size) * 100
     return original_size, optimized_size, reduction_percentage
+
+
+def _extreme_optimize_file(args) -> None:
+    if args.output is None:
+        raise ValueError("Output file must be specified for single file input")
+    original_size, optimized_size, reduction_percentage = (
+        extreme_pdf_optimization(
+            args.input,
+            args.output,
+            args.threads,
+            args.grayscale,
+            args.flatten,
+        )
+    )
+    logging.info("Processed: %s", os.path.basename(args.input))
+    logging.info("Original size: %d bytes", original_size)
+    logging.info("Optimized size: %d bytes", optimized_size)
+    logging.info("Size reduction: %.2f%%", reduction_percentage)
 
 
 def run(args: argparse.Namespace) -> None:
@@ -1704,25 +1909,14 @@ def run(args: argparse.Namespace) -> None:
                 args.output_dir,
                 args.threads,
                 args.grayscale,
-                args.flatten
-            )
-        else:
-            original_size, optimized_size, reduction_percentage = extreme_pdf_optimization(
-                args.input,
-                args.output,
-                args.threads,
-                args.grayscale,
                 args.flatten,
             )
-            logging.info("Processed: %s", os.path.basename(args.input))
-            logging.info("Original size: %d bytes", original_size)
-            logging.info("Optimized size: %d bytes", optimized_size)
-            logging.info("Size reduction: %.2f%%", reduction_percentage)
+        else:
+            _extreme_optimize_file(args)
     except Exception as e:  # pylint: disable=broad-except
         raise PDFProcessingError(
             "Error during PDF optimization", traceback.format_exc()
         ) from e
-
 
 
 def optimize(args: argparse.Namespace) -> None:
@@ -1752,7 +1946,9 @@ def main() -> None:
     cli_args = parse_arguments()
 
     # Set up logging
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    )
 
     # Determine the maximum number of open files allowed by the system
     _soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -1763,12 +1959,18 @@ def main() -> None:
     # Calculate the initial number of concurrent files to process
     current_open_files: int = get_open_files_count()
     available_fds: int = hard_limit - current_open_files
-    initial_concurrent_files: int = min(int(available_fds * MAX_FD_USAGE_PERCENT / 100), cli_args.max_files)
+    initial_concurrent_files: int = min(
+        int(available_fds * MAX_FD_USAGE_PERCENT / 100), cli_args.max_files
+    )
 
     # Create an adaptive semaphore
-    file_semaphore = AdaptiveSemaphore(initial_concurrent_files, cli_args.max_files)
+    file_semaphore = AdaptiveSemaphore(
+        initial_concurrent_files, cli_args.max_files
+    )
 
-    logging.info("Initial maximum concurrent files: %d", initial_concurrent_files)
+    logging.info(
+        "Initial maximum concurrent files: %d", initial_concurrent_files
+    )
     logging.info("Current open files: %d", current_open_files)
     logging.info("Available file descriptors: %d", available_fds)
 
@@ -1790,10 +1992,16 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Advanced PDF Distiller")
     parser.add_argument("input", type=str, help="Input PDF file or directory")
     parser.add_argument(
-        "--output", type=str, help="Output optimized PDF file (for single file input)"
+        "output",
+        type=str,
+        nargs="?",
+        help="Output optimized PDF file (for single file input)",
     )
     parser.add_argument(
-        "--output_dir", type=str, default="optimized-pdfs", help="Output directory for optimized PDFs (for directory input)"
+        "--output_dir",
+        type=str,
+        default="optimized-pdfs",
+        help="Output directory for optimized PDFs (for directory input)",
     )
     parser.add_argument(
         "--threads",
