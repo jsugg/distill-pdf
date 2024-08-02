@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DistillPDF.
+DistillPDF: Advanced PDF Optimization and Transformation Tool
 
 This script provides comprehensive functionalities to optimize and transform
 PDF files. It includes capabilities for resizing and compressing images within
@@ -12,26 +12,41 @@ metadata for privacy, cleaning unused resources, and optimizing the entire
 content stream of PDF pages.
 
 Features:
-    - Image resizing and compression to predefined dimensions and quality.
+    - Image resizing and compression with configurable dimensions and quality.
     - Conversion of colored images to grayscale to reduce complexity.
-    - Flattening of PDF annotations and form fields to static images.
-    - Font subsetting to include only the characters used in the document.
+    - Flattening of PDF annotations and form fields to static content.
+    - Aggressive font subsetting to include only the characters used in the document.
     - Metadata removal for enhanced privacy and security.
     - Cleanup of unreferenced PDF resources to shrink file size.
     - Content stream optimization to strip unnecessary data.
-    - Vector graphic simplification based on adjustable precision levels.
+    - Vector graphic simplification using Bayesian optimization for optimal results.
+    - Text-aware and shape-aware vector optimization to preserve important content.
     - Multi-threaded processing for performance optimization.
-    - Detailed logging of processes and errors for troubleshooting and analysis.
     - Parallel batch processing of multiple PDFs from a directory.
-    - Real-time adaptation to system file descriptor limits.
+    - Adaptive concurrency management to handle system file descriptor limits.
+    - Extreme optimization mode for maximum file size reduction.
+    - Detailed logging of processes and errors for troubleshooting and analysis.
+
+Benefits for Vector Embeddings and RAG Systems:
+    The optimizations performed by this script can offer benefits for creating
+    vector embeddings and using PDFs in Retrieval-Augmented Generation (RAG) systems:
+    
+    - Processing Speed: Smaller file sizes may lead to faster text extraction
+      for embedding creation, especially beneficial for large PDF collections.
+    - Storage Efficiency: Reduced file sizes allow storing more documents in
+      vector databases, potentially improving the knowledge breadth for RAG systems.
+    - Cleaner Text Extraction: Flattening annotations and form fields may result
+      in cleaner text extraction, potentially improving embedding quality.
+    - Noise Reduction: Cleaning unreferenced resources might remove noise that
+      could otherwise be captured in the embedding process.
 
 The script utilizes a combination of libraries including PyMuPDF (fitz), pikepdf,
-PIL, OpenCV, scikit-learn, scipy, and numpy to perform its operations, integrating
+OpenCV, scikit-learn, scipy, and numpy to perform its operations, integrating
 advanced image processing, machine learning for optimization decisions, and direct
 PDF manipulation capabilities.
 
 Setup:
-    Ensure you have Python version 3.8.x installed.
+    Ensure you have Python version >= 3.9 installed.
     
     $ pip install -r requirements.txt
     $ chmod +x distillpdf
@@ -42,8 +57,7 @@ Setup:
 Usage:
     To use the script, provide an input PDF file or directory and an output destination, along with
     optional flags for grayscale conversion, flattening, and specifying the number of
-    processing threads. The script is designed to be run as a script and can be invoked
-    from the command line.
+    processing threads. The script is designed to be run as a command-line tool.
 
 Example:
     $ ./distillpdf input.pdf --output output.pdf --threads=4 --grayscale --flatten
@@ -52,6 +66,8 @@ Example:
 Design:
     This script is designed for high-performance environments where precision and file
     size reduction are critical, suitable for both commercial and academic applications.
+    It employs adaptive concurrency management and Bayesian optimization to balance
+    processing speed with system resource constraints and optimization quality.
 
 Author:
     Juan Sugg Gilbert
@@ -72,7 +88,7 @@ import argparse
 import tempfile
 import logging
 import shutil
-from typing import Any, Dict, List, Tuple, Set, Optional, Union, Callable
+from typing import Any, List, Tuple, Set, Optional, Callable
 import math
 import random
 import concurrent.futures
@@ -80,10 +96,8 @@ from functools import lru_cache, wraps
 import multiprocessing
 from multiprocessing.pool import ApplyResult
 import concurrent.futures
-import difflib
 import time
 import resource
-from pikepdf._core import _ObjectMapping
 import psutil
 
 import numpy as np
@@ -94,9 +108,6 @@ from scipy.optimize import minimize, OptimizeResult
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, Sum, WhiteKernel
-from skimage.metrics import structural_similarity as ssim
-import pytesseract
-from PIL import Image
 from fontTools import subset
 from fontTools.ttLib import TTFont
 import pikepdf
